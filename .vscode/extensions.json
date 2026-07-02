@@ -1,0 +1,7 @@
+{
+  "// recommendations": "C/C++ tools power C++ IntelliSense + Ctrl-click into ../cheatah. The cheatah extension (.purr highlighting + Go-to-Definition) is local: install it with `code --install-extension ../cheatah/editors/vscode/cheatah.vsix`.",
+  "recommendations": [
+    "ms-vscode.cpptools",
+    "ms-vscode.cmake-tools"
+  ]
+}

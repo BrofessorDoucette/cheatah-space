@@ -1,0 +1,26 @@
+# space.time — J2000 epoch offsets (seconds and Julian centuries).
+import io
+import space.time as st
+import check
+
+io.print("== space.time: J2000 ==")
+let f = 0
+
+# at J2000 both offsets are zero
+f += check.close_eq("seconds at J2000", st.jd_to_j2000_seconds(2451545.0), 0.0)
+f += check.close_eq("centuries at J2000", st.jd_to_j2000_centuries(2451545.0), 0.0)
+
+# one Julian century after J2000 = 36525 days
+f += check.close_eq("seconds +1 century", st.jd_to_j2000_seconds(2451545.0 + 36525.0), 3155760000.0)
+f += check.close_eq("centuries +1 century", st.jd_to_j2000_centuries(2451545.0 + 36525.0), 1.0)
+
+# half a century
+f += check.close_eq("centuries +0.5 century", st.jd_to_j2000_centuries(2451545.0 + 18262.5), 0.5)
+
+# one day after J2000
+f += check.close_eq("seconds +1 day", st.jd_to_j2000_seconds(2451546.0), 86400.0)
+
+# negative direction (before J2000)
+f += check.close_eq("centuries -1 century", st.jd_to_j2000_centuries(2451545.0 - 36525.0), 0.0 - 1.0)
+
+check.result(f)

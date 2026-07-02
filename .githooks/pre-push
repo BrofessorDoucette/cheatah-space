@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+# pre-push — block any push to any remote/branch unless the qa_gate passes.
+#
+# Enabled by `git config core.hooksPath .githooks` (run scripts/setup-hooks.sh once, or it is
+# wired automatically by the CMake configure step). Bypass in a genuine emergency with
+# `git push --no-verify` — but that is exactly what this gate exists to discourage.
+set -u
+
+REPO_ROOT="$(git rev-parse --show-toplevel)"
+GATE="$REPO_ROOT/scripts/qa_gate.sh"
+
+if [ ! -x "$GATE" ]; then
+    echo "pre-push: scripts/qa_gate.sh missing or not executable — refusing to push." >&2
+    exit 1
+fi
+
+echo "pre-push: running qa_gate before allowing the push…"
+if "$GATE"; then
+    echo "pre-push: qa_gate passed — push allowed."
+    exit 0
+fi
+
+echo "pre-push: qa_gate FAILED — push blocked. Fix the tests (or --no-verify to override)." >&2
+exit 1

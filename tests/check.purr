@@ -1,0 +1,91 @@
+# tests/check — a tiny assertion helper for the cheatah-side test suite.
+#
+# Imported (relative) by each test program: `import check`. Every assertion prints a PASS/FAIL
+# line and RETURNS the failure count (0 or 1) so a test accumulates `let fails = fails + ...`,
+# then prints `check.result(fails)` to emit the machine-checked verdict the qa_gate greps for.
+# Definitions only — importing this runs nothing.
+
+import io
+import math
+
+# Relative-tolerance float compare (handles the large magnitudes of JD / CDF_EPOCH).
+#
+# @param a first value.
+# @param b second value.
+# @param rel relative tolerance.
+# @return true when |a-b| <= rel * max(1, |b|).
+# @complexity O(1).
+# @alloc none.
+fn close(a, b, rel) {
+    let scale = math.abs(b)
+    if scale < 1.0 { scale = 1.0 }
+    return math.abs(a - b) <= rel * scale
+}
+
+# Assert two floats are close; print PASS/FAIL, return the failure count (0 or 1).
+#
+# @param name the check's label.
+# @param got the computed value.
+# @param want the expected value.
+# @return 0 on pass, 1 on fail.
+# @complexity O(1).
+# @alloc none.
+fn close_eq(name, got, want) {
+    if close(got, want, 0.000000001) {
+        io.print("  PASS", name)
+        return 0
+    }
+    io.print("  FAIL", name, "got", got, "want", want)
+    return 1
+}
+
+# Assert two floats are within an ABSOLUTE tolerance — for round-trips through a Julian Date,
+# whose ~2.44e6 day offset leaves a double only ~50 microseconds of resolution near the
+# present epoch (so a 1 s value round-trips to ~0.999995, not 1.0 — inherent, not a bug).
+#
+# @param name the check's label.
+# @param got the computed value.
+# @param want the expected value.
+# @param tol absolute tolerance.
+# @return 0 on pass, 1 on fail.
+# @complexity O(1).
+# @alloc none.
+fn near_eq(name, got, want, tol) {
+    if math.abs(got - want) <= tol {
+        io.print("  PASS", name)
+        return 0
+    }
+    io.print("  FAIL", name, "got", got, "want", want)
+    return 1
+}
+
+# Assert a boolean condition; print PASS/FAIL, return the failure count (0 or 1).
+#
+# @param name the check's label.
+# @param cond the condition that must hold.
+# @return 0 on pass, 1 on fail.
+# @complexity O(1).
+# @alloc none.
+fn is_true(name, cond) {
+    if cond {
+        io.print("  PASS", name)
+        return 0
+    }
+    io.print("  FAIL", name)
+    return 1
+}
+
+# Emit the suite verdict the qa_gate parses. Prints `RESULT: PASS` iff no checks failed.
+#
+# @param fails the accumulated failure count.
+# @return the failure count (so a caller may chain/propagate it).
+# @complexity O(1).
+# @alloc none.
+fn result(fails) {
+    if fails == 0 {
+        io.print("RESULT: PASS")
+    } else {
+        io.print("RESULT: FAIL", fails)
+    }
+    return fails
+}

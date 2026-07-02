@@ -1,0 +1,35 @@
+# space.time — vectorized over an ndarray of timestamps (the NumericArray concept path).
+# The SAME templated functions accept a whole array and broadcast elementwise.
+import io
+import ndarray
+import space.time as st
+import check
+
+io.print("== space.time: vectorized (ndarray) ==")
+let f = 0
+
+let xs = ndarray.array([0.0, 86400.0, 946728000.0])
+
+# unix -> JD, elementwise
+let jd = st.unix_to_jd(xs)
+f += check.close_eq("jd[0]", jd[0], 2440587.5)
+f += check.close_eq("jd[1]", jd[1], 2440588.5)
+f += check.close_eq("jd[2]", jd[2], 2451545.0)
+f += check.close_eq("jd sum", ndarray.sum(jd), 7332721.0)
+
+# the array path must agree with the scalar path, element by element
+f += check.is_true("jd[0] == scalar", jd[0] == st.unix_to_jd(0.0))
+f += check.is_true("jd[2] == scalar", jd[2] == st.unix_to_jd(946728000.0))
+
+# round trip on the array
+let back = st.jd_to_unix(jd)
+f += check.close_eq("rt[0]", back[0], 0.0)
+f += check.close_eq("rt[2]", back[2], 946728000.0)
+
+# MJD and CDF_EPOCH vectorized too
+let mjd = st.unix_to_mjd(xs)
+f += check.close_eq("mjd[2]", mjd[2], 51544.5)
+let cdf = st.unix_to_cdf_epoch(xs)
+f += check.close_eq("cdf[2]", cdf[2], 63113947200000.0)
+
+check.result(f)

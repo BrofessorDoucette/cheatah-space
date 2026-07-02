@@ -1,0 +1,29 @@
+# space.time — Julian Date conversions, exercised through the imported library.
+import io
+import space.time as st
+import check
+
+io.print("== space.time: Julian Date ==")
+let f = 0
+
+# reference epochs
+f += check.close_eq("jd_unix_epoch", st.jd_unix_epoch(), 2440587.5)
+f += check.close_eq("jd_j2000", st.jd_j2000(), 2451545.0)
+
+# known instants: Unix seconds -> JD (exact)
+f += check.close_eq("unix 0 -> JD", st.unix_to_jd(0.0), 2440587.5)
+f += check.close_eq("unix +1d -> JD", st.unix_to_jd(86400.0), 2440588.5)
+f += check.close_eq("unix -1d -> JD", st.unix_to_jd(0.0 - 86400.0), 2440586.5)
+f += check.close_eq("J2000 unix -> JD", st.unix_to_jd(946728000.0), 2451545.0)
+
+# inverse: JD -> Unix seconds (exact)
+f += check.close_eq("JD epoch -> unix 0", st.jd_to_unix(2440587.5), 0.0)
+f += check.close_eq("JD J2000 -> unix", st.jd_to_unix(2451545.0), 946728000.0)
+
+# round trips over a spread of real timestamps (absolute 1 ms tol — JD double precision)
+let ts = [0.0, 1.0, 1000.0, 86400.0, 946728000.0, 1700000000.0]
+for s in ts {
+    f += check.near_eq("unix->jd->unix", st.jd_to_unix(st.unix_to_jd(s)), s, 0.001)
+}
+
+check.result(f)

@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(ls -la /home/brofessordoucette/Dev/cheatah/runtime/)",
+      "Read(//home/brofessordoucette/Dev/cheatah/runtime/**)",
+      "Bash(find /home/brofessordoucette/Dev/cheatah -name \"biome.purr\" -o -name \"*.biome\" | head -5)",
+      "Read(//home/brofessordoucette/Dev/cheatah/**)"
+    ]
+  }
+}

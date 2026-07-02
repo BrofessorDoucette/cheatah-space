@@ -1,0 +1,28 @@
+# space.time — Modified Julian Date conversions.
+import io
+import space.time as st
+import check
+
+io.print("== space.time: Modified Julian Date ==")
+let f = 0
+
+# JD <-> MJD (MJD = JD - 2400000.5), exact
+f += check.close_eq("jd_to_mjd(J2000)", st.jd_to_mjd(2451545.0), 51544.5)
+f += check.close_eq("mjd_to_jd(J2000)", st.mjd_to_jd(51544.5), 2451545.0)
+
+# Unix <-> MJD, exact
+f += check.close_eq("unix 0 -> MJD", st.unix_to_mjd(0.0), 40587.0)
+f += check.close_eq("MJD -> unix 0", st.mjd_to_unix(40587.0), 0.0)
+f += check.close_eq("J2000 unix -> MJD", st.unix_to_mjd(946728000.0), 51544.5)
+
+# round trips (Unix path goes through JD's offset — absolute 1 ms tol)
+let ts = [0.0, 86400.0, 946728000.0, 1700000000.0]
+for s in ts {
+    f += check.near_eq("unix->mjd->unix", st.mjd_to_unix(st.unix_to_mjd(s)), s, 0.001)
+}
+let jds = [2440587.5, 2451545.0, 2460000.5]
+for j in jds {
+    f += check.close_eq("jd->mjd->jd", st.mjd_to_jd(st.jd_to_mjd(j)), j)
+}
+
+check.result(f)

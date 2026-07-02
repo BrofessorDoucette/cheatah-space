@@ -1,0 +1,16 @@
+{
+  "// IntelliSense": "Resolve C++ includes/flags from the includePath in c_cpp_properties.json (the header-only extension produces little in compile_commands); this is what makes Ctrl-click jump into the original ../cheatah library.",
+  "C_Cpp.default.cppStandard": "c++20",
+  "C_Cpp.default.intelliSenseMode": "linux-gcc-x64",
+  "C_Cpp.default.compilerPath": "/usr/bin/g++",
+
+  "// C++ colorization": "Semantic recoloring mis-paints identifiers in the concept/template-heavy headers (cheatah hit the same); let the TextMate C++ grammar be the sole source of truth so C++ highlights correctly.",
+  "C_Cpp.enhancedColorization": "disabled",
+  "C_Cpp.configurationWarnings": "disabled",
+
+  "// cheatah (.purr) highlighting": "Map .purr to the `cheatah` language, provided by the cheatah VS Code extension (../cheatah/editors/vscode). Install it once: code --install-extension ../cheatah/editors/vscode/cheatah.vsix — it also gives Go-to-Definition from .purr into the cheatah libraries.",
+  "files.associations": {
+    "*.purr": "cheatah",
+    "*.hpp": "cpp"
+  }
+}
