@@ -4,7 +4,7 @@ All notable changes to cheatah-space. This project is **alpha** — expect break
 between releases. It is a cheatah standard-library extension and joins the Biome Standard
 alongside the other cheatah extensions.
 
-## v0.1.0-alpha (unreleased) — the time module, house-gated
+## v0.1.0-alpha (2026-08-14) — the time module, house-gated
 
 The first release-shaped state of the repo: one working module, `space.time` (Julian Date,
 Modified Julian Date, the J2000 epoch offsets, and the NASA CDF_EPOCH bridge), hand-authored
