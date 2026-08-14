@@ -1,0 +1,13 @@
+# cheatah-space — biome manifest.
+#
+# Marks this repo as a cheatah standard-library extension: the `space` package — astronomy and
+# space-physics. A downstream project runs `biome add cheatah-space`, then `import space.time`
+# (etc.). Pure cheatah: no extension dependencies, no system dependencies — the headers and the
+# toolchain are the whole install.
+
+[project]
+name = "cheatah-space"
+
+[cheatah]
+# Toolchain version this extension targets (git tag of the cheatah repo). Bump deliberately.
+version = "1.10.0-alpha"
