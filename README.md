@@ -1,10 +1,8 @@
 # cheatah-space
 
-> ⚠️ **Work in progress.** Early scaffold. `space.time` works and is tested; `space.cdf` and
-> `space.irbem` are roadmaps only. End-to-end `biome add cheatah-space` also depends on a
-> cheatah toolchain increment that is still WIP (wiring an extension's headers into purrc's
-> link line) — today the modules build and the tests pass via `purrc --import-root`. APIs,
-> layout, and namespaces may change.
+> ⚠️ **Work in progress.** Early alpha. `space.time` works, is fully covered, and is
+> QA-gated; `space.cdf` and `space.irbem` are roadmaps only. APIs, layout, and namespaces may
+> change until the first tagged release.
 
 The first cheatah standard-library **extension**: the `space` package — astronomy and
 space-physics. Hand-authored, header-only C++20 (templated with concepts), surfaced in the
@@ -24,6 +22,12 @@ import ndarray
 let jd  = st.unix_to_jd(1700000000.0)                   # one timestamp -> Julian Date
 let jds = st.unix_to_jd(ndarray.array([0.0, 86400.0]))  # a whole array, vectorized
 ```
+
+Every module header ships with a `.sha512` sidecar (scripts/sign-modules.sh), so purrc
+resolves `import space.time` as a VERIFIED module on the extension path
+(`CHEATAH_MODULE_PATH`, which `biome add` sets) and the runtime checks the header on load —
+no git checkout, no `--import-root`. The QA gate sandboxes that exact consumer flow on every
+push (scripts/test-biome-install.sh).
 
 ## Modules
 
@@ -45,47 +49,74 @@ required and never linked. Performance wins are documented per function with `@p
 - **Performance.** Concept-templated and vectorized over `ndarray` (SIMD); benchmarked against
   the references, shipped only when we win.
 - **Security.** Explicit concepts reject bad inputs at compile time; the modules are pure and
-  allocation-free for scalars; the toolchain signs and verifies module headers.
-- **Honest docs.** Every function carries `@complexity`, `@alloc`, `@test`/`@systest`, and
-  `@perf` where benchmarked. Brief everywhere else.
+  allocation-free for scalars; every module header is signed and verified on load. Threat
+  model + standing review: [SECURITY.md](SECURITY.md).
+- **Honest docs.** Every function carries `@complexity`, `@alloc`, truthful `@systest` tags,
+  and an `@par Example` whose `@code{.purr}` block the gate COMPILES; `@perf` where
+  benchmarked. The doc gate holds the public API at 100% Javadoc.
 
 ## Layout
 
 ```
 cheatah-space/
-├── space/                  # the `space` package (import root)
-│   ├── space.hpp           # package header — includes the submodules
+├── space/                  # the `space` package (import root; headers + .sha512 sidecars)
+│   ├── space.hpp           # package umbrella — includes the submodules
 │   ├── time/time.hpp       # space.time  (C++20, concepts, vectorized)   [working]
 │   ├── cdf/                # space.cdf    (roadmap)
 │   └── irbem/              # space.irbem  (roadmap)
-├── tests/                  # the test suite, written in cheatah (.purr), importing space.*
-│   ├── check.purr          # tiny assertion helper
-│   └── test_*.purr
-├── scripts/qa_gate.sh      # compiles + runs every test through purrc/cheatah
-├── .githooks/pre-push      # blocks pushes unless the qa_gate passes
-├── cmake/CPM.cmake         # CPM bootstrap (only for fetching the toolchain when standalone)
+├── systests/               # cheatah (.purr) system tests, importing space.* end to end
+├── tests/                  # C++ unit tests (GoogleTest) — the coverage + memcheck harness
+├── scripts/                # qa_gate.sh + the individual checks it runs (see Developing)
+├── security/               # run-valgrind.sh + suppressions
+├── .githooks/              # commit-msg (private-refs scan) + pre-push (the qa_gate)
+├── cheatah.toml            # biome manifest (pure cheatah — no dependencies)
 ├── CMakeLists.txt          # header-only INTERFACE target + standalone test/hook wiring
-└── .vscode/                # IntelliSense → Ctrl-click into ../cheatah; .purr highlighting
+├── CMakePresets.json       # debug / release / asan presets
+└── Doxyfile                # the doc parser config (XML out; doc_coverage.sh strict mode)
 ```
 
 ## Developing
 
-The extension is header-only, so there is nothing to compile to *use* it. To run the tests you
-need the cheatah toolchain; while it is mid-release we build against the **local sibling
-checkout** at `../cheatah`.
+The extension is header-only, so there is nothing to compile to *use* it. To develop it you
+need the cheatah toolchain: the **local sibling checkout** at `../cheatah` (override with
+`CHEATAH_DIR`) provides `purrc`, the `cheatah` runtime, and the stdlib sources the C++ unit
+tests compile against. The toolchain is **not** vendored here.
 
 ```sh
 ./scripts/setup-hooks.sh    # once: point git at .githooks (also done by cmake configure)
-./scripts/qa_gate.sh        # compile every tests/*.purr against space.* and run it
+./scripts/qa_gate.sh        # the full gate the pre-push hook enforces
 ```
 
-The qa_gate locates a built `purrc`/`cheatah` under `../cheatah/build/*` (override with
-`CHEATAH_DIR`), builds the toolchain if needed, then compiles and runs each cheatah test —
-which also gates that the C++ templates instantiate cleanly on both the scalar and ndarray
-paths. The **pre-push hook** runs this gate and blocks the push on failure (`--no-verify`
-overrides, in a real emergency).
+The QA gate runs, in order — every stage a hard gate:
 
-The full cheatah toolchain is **not** vendored here; CPM (or the local checkout) provides it.
+1. **Unit coverage** — clang source-based, **100% lines + functions** over the `space/`
+   headers via `cheatah_space_tests` (scripts/coverage.sh; the table below is drift-checked).
+2. **Doc coverage** — 100% Javadoc (scripts/doc_coverage.sh) and every `@par Example`
+   block compiles (scripts/check_doc_examples.sh).
+3. **Module sidecars** — every header verifies against its `.sha512` (sign-modules.sh).
+4. **Build** (debug preset).
+5. **System tests** — each `systests/test_*.purr` compiled by purrc against `space/` and run
+   under the cheatah runtime (`RESULT: PASS`), which also gates that the templates
+   instantiate cleanly on the scalar AND ndarray paths. Then the **biome-install sandbox**.
+6. **Unit tests** (ctest), then **ASan + UBSan**, then **Valgrind memcheck**, then
+   **cppcheck**, then the **private-reference scan**.
+
+### Unit-test coverage
+
+Measured by scripts/coverage.sh (clang source-based) over the space package headers;
+committed by the gate:
+
+<!-- coverage:start -->
+| Metric | space package |
+|--------|---------------|
+| **Lines** | 100.00% (33/33) |
+| **Functions** | 100.00% (13/13) |
+| Regions | 100.00% |
+| Branches | - |
+<!-- coverage:end -->
+
+(`space.time` is straight-line arithmetic — it has no branches; the Branches metric will
+light up with `space.cdf`.)
 
 ## License
 
