@@ -69,13 +69,14 @@ Testing/
 .cache/
 
 # --- cheatah-space ---
-# CPM's downloaded bootstrap (the committed cmake/CPM.cmake stays; the versioned copy is fetched).
-cmake/CPM_*.cmake
 # Optional, dev-only reference implementations: fetched ad hoc to verify/benchmark against,
 # NEVER required and NEVER committed (the extension itself has zero dependencies).
 space/cdf/vendor/
 space/irbem/vendor/
 # Generated test-helper header (qa_gate emits it to a temp dir; this guards stray local copies).
-tests/check.hpp
-tests/check.hpp.sha512
-# The space.* module headers are hand-authored C++ and ARE committed (space/**/*.hpp).
+systests/check.hpp
+systests/check.hpp.sha512
+# Doxygen output (Doxyfile OUTPUT_DIRECTORY=docs, XML only) — generated, never committed.
+docs/xml/
+# The space.* module headers are hand-authored C++ and ARE committed (space/**/*.hpp),
+# each alongside its .sha512 sidecar (scripts/sign-modules.sh).

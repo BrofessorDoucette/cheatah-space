@@ -5,14 +5,14 @@
 # in with `biome add cheatah-space`, then `import space.time` (etc.).
 #
 # ZERO DEPENDENCIES — like cheatah itself, this extension pulls in nothing external. The only
-# build input is the cheatah toolchain (for purrc + the cmake helpers when building/testing
-# standalone). NASA CDF and PRBEM/IRBEM are NEVER required: they are optional, dev-only
+# build input is the cheatah toolchain (for purrc + the stdlib headers the dev-time C++ tests
+# compile against). NASA CDF and PRBEM/IRBEM are NEVER required: they are optional, dev-only
 # references used to verify and benchmark space.cdf / space.irbem, gated behind a flag.
 #
 # Modules (see each subdir README for status & roadmap):
 #   space.time   — Julian dates & epoch conversions (incl. the CDF_EPOCH bridge)   [WORKING]
 #   space.cdf    — NASA Common Data Format I/O, from scratch in C++                 [roadmap]
-#   space.irbem  — radiation-belt / magnetic-field models, reimplementing IRBEM     [roadmap]
+#   space.irbem  — radiation-belt / magnetic-field models, reimplemented clean-room [roadmap]
 cmake_minimum_required(VERSION 3.24)
 project(cheatah-space LANGUAGES CXX)
 
@@ -36,6 +36,9 @@ if(NOT PROJECT_IS_TOP_LEVEL)
     return()
 endif()
 
+# A single, predictable output tree (so scripts/coverage.sh finds ./bin/cheatah_space_tests).
+set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+
 # --- Standalone dev: wire git hooks so a push runs the qa_gate ----------------------------
 if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/.git" OR EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/../.git")
     execute_process(
@@ -45,15 +48,33 @@ if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/.git" OR EXISTS "${CMAKE_CURRENT_SOURCE_D
     message(STATUS "cheatah-space: git pre-push hook -> scripts/qa_gate.sh")
 endif()
 
-# --- Tests: the cheatah (.purr) suite, run through the qa_gate as one ctest ----------------
-# The gate compiles each tests/*.purr against the `space` package with purrc and runs it,
-# which also gates that the C++ templates instantiate cleanly (scalar + ndarray paths).
+# The sibling checkout the qa_gate + dev-time tests need: the cheatah toolchain (purrc + the
+# cheatah runtime + the stdlib sources the C++ tests compile). Override to relocate it.
+set(CHEATAH_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../cheatah" CACHE PATH "cheatah toolchain checkout")
+
+# --- Options -----------------------------------------------------------------------------------
+option(CHEATAH_SPACE_BUILD_TESTS "Build the C++ unit tests (fetches GoogleTest)" OFF)
+option(CHEATAH_SPACE_SANITIZE    "Build the unit tests with ASan + UBSan" OFF)
+
+# --- C++ unit tests: GoogleTest, fetched ONLY under this option --------------------------------
+include(FetchContent)
+if(CHEATAH_SPACE_BUILD_TESTS)
+    FetchContent_Declare(googletest
+        GIT_REPOSITORY https://github.com/google/googletest.git
+        GIT_TAG        52eb8108c5bdec04579160ae17225d66034bd723)  # pinned (matches ../cheatah)
+    set(gtest_force_shared_crt ON CACHE BOOL "" FORCE)
+    FetchContent_MakeAvailable(googletest)
+    enable_testing()
+    add_subdirectory(tests)
+endif()
+
+# --- The cheatah (.purr) system suite, run through the qa_gate as one ctest ----------------
+# The gate compiles each systests/test_*.purr against the `space` package with purrc and runs
+# it, which also gates that the C++ templates instantiate cleanly (scalar + ndarray paths).
 include(CTest)
 if(BUILD_TESTING)
     add_test(NAME qa_gate
              COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/scripts/qa_gate.sh
              WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
-    # Let the gate find the sibling toolchain; override -DCHEATAH_DIR to relocate it.
-    set(CHEATAH_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../cheatah" CACHE PATH "cheatah toolchain checkout")
     set_tests_properties(qa_gate PROPERTIES ENVIRONMENT "CHEATAH_DIR=${CHEATAH_DIR}")
 endif()
