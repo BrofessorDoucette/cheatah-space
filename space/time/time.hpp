@@ -93,7 +93,16 @@ concept TimeInput = Numeric<T> || DatetimeScalar<T> || NumericArray<T> || Dateti
  * @return `2440587.5`.
  * @complexity O(1).
  * @alloc none.
- * @test SpaceTime.Epochs
+ * @systest systests/test_jd.purr
+ * @par Example
+ * @code{.purr}
+ * import io
+ * import space.time as st
+ *
+ * # The Unix epoch's Julian Date is the anchor of every unix<->jd conversion.
+ * io.print(st.jd_unix_epoch())                       # 2440587.5
+ * io.print(st.unix_to_jd(0.0) == st.jd_unix_epoch()) # true
+ * @endcode
  */
 constexpr double jd_unix_epoch() { return 2440587.5; }
 
@@ -102,7 +111,16 @@ constexpr double jd_unix_epoch() { return 2440587.5; }
  * @return `2451545.0`.
  * @complexity O(1).
  * @alloc none.
- * @test SpaceTime.Epochs
+ * @systest systests/test_jd.purr
+ * @par Example
+ * @code{.purr}
+ * import io
+ * import space.time as st
+ *
+ * # J2000.0 — the reference epoch of modern astronomical series.
+ * io.print(st.jd_j2000())                            # 2451545.0
+ * io.print(st.jd_to_j2000_seconds(st.jd_j2000()))    # 0.0 — J2000 is its own origin
+ * @endcode
  */
 constexpr double jd_j2000() { return 2451545.0; }
 
@@ -112,7 +130,16 @@ constexpr double jd_j2000() { return 2451545.0; }
  * @return `62167219200000.0`.
  * @complexity O(1).
  * @alloc none.
- * @test SpaceTime.CdfEpoch
+ * @systest systests/test_cdf_epoch.purr
+ * @par Example
+ * @code{.purr}
+ * import io
+ * import space.time as st
+ *
+ * # The Unix epoch expressed as a CDF_EPOCH (ms since year 0).
+ * io.print(st.cdf_epoch_unix_offset_ms())                             # 62167219200000.0
+ * io.print(st.unix_to_cdf_epoch(0.0) == st.cdf_epoch_unix_offset_ms())  # true
+ * @endcode
  */
 constexpr double cdf_epoch_unix_offset_ms() { return 62167219200000.0; }
 
@@ -124,9 +151,18 @@ constexpr double cdf_epoch_unix_offset_ms() { return 62167219200000.0; }
  * @return the corresponding Julian Date(s).
  * @complexity O(n).
  * @alloc one result array for an ndarray; none for a scalar.
- * @test SpaceTime.UnixJdRoundTrip
- * @test SpaceTime.KnownDates
- * @test SpaceTime.Vectorized
+ * @systest systests/test_jd.purr
+ * @systest systests/test_vectorized.purr
+ * @par Example
+ * @code{.purr}
+ * import io
+ * import ndarray
+ * import space.time as st
+ *
+ * io.print(st.unix_to_jd(946728000.0))               # 2451545.0 — J2000, exactly
+ * let jds = st.unix_to_jd(ndarray.array([0.0, 86400.0]))   # a whole array, vectorized
+ * io.print(jds[0], jds[1])                           # 2440587.5 2440588.5
+ * @endcode
  */
 auto unix_to_jd(TimeInput auto&& seconds) {
     return seconds / 86400.0 + 2440587.5;
@@ -138,8 +174,16 @@ auto unix_to_jd(TimeInput auto&& seconds) {
  * @return seconds since 1970-01-01T00:00:00Z.
  * @complexity O(n).
  * @alloc one result array for an ndarray; none for a scalar.
- * @test SpaceTime.UnixJdRoundTrip
- * @test SpaceTime.Vectorized
+ * @systest systests/test_jd.purr
+ * @systest systests/test_vectorized.purr
+ * @par Example
+ * @code{.purr}
+ * import io
+ * import space.time as st
+ *
+ * io.print(st.jd_to_unix(2451545.0))                 # 946728000.0 — J2000 in Unix seconds
+ * io.print(st.jd_to_unix(st.unix_to_jd(86400.0)))    # 86400.0 — the round trip
+ * @endcode
  */
 auto jd_to_unix(TimeInput auto&& jd) {
     return (jd - 2440587.5) * 86400.0;
@@ -151,7 +195,14 @@ auto jd_to_unix(TimeInput auto&& jd) {
  * @return the Modified Julian Date(s).
  * @complexity O(n).
  * @alloc one result array for an ndarray; none for a scalar.
- * @test SpaceTime.MjdRoundTrip
+ * @systest systests/test_mjd.purr
+ * @par Example
+ * @code{.purr}
+ * import io
+ * import space.time as st
+ *
+ * io.print(st.jd_to_mjd(st.jd_j2000()))              # 51544.5 — J2000 as an MJD
+ * @endcode
  */
 auto jd_to_mjd(TimeInput auto&& jd) {
     return jd - 2400000.5;
@@ -163,7 +214,14 @@ auto jd_to_mjd(TimeInput auto&& jd) {
  * @return the Julian Date(s).
  * @complexity O(n).
  * @alloc one result array for an ndarray; none for a scalar.
- * @test SpaceTime.MjdRoundTrip
+ * @systest systests/test_mjd.purr
+ * @par Example
+ * @code{.purr}
+ * import io
+ * import space.time as st
+ *
+ * io.print(st.mjd_to_jd(51544.5))                    # 2451545.0 — back to a full JD
+ * @endcode
  */
 auto mjd_to_jd(TimeInput auto&& mjd) {
     return mjd + 2400000.5;
@@ -175,7 +233,15 @@ auto mjd_to_jd(TimeInput auto&& mjd) {
  * @return the Modified Julian Date(s).
  * @complexity O(n).
  * @alloc one result array for an ndarray; none for a scalar.
- * @test SpaceTime.MjdRoundTrip
+ * @systest systests/test_mjd.purr
+ * @systest systests/test_vectorized.purr
+ * @par Example
+ * @code{.purr}
+ * import io
+ * import space.time as st
+ *
+ * io.print(st.unix_to_mjd(0.0))                      # 40587.0 — the Unix epoch's MJD
+ * @endcode
  */
 auto unix_to_mjd(TimeInput auto&& seconds) {
     return jd_to_mjd(unix_to_jd(seconds));
@@ -187,7 +253,14 @@ auto unix_to_mjd(TimeInput auto&& seconds) {
  * @return seconds since the Unix epoch.
  * @complexity O(n).
  * @alloc one result array for an ndarray; none for a scalar.
- * @test SpaceTime.MjdRoundTrip
+ * @systest systests/test_mjd.purr
+ * @par Example
+ * @code{.purr}
+ * import io
+ * import space.time as st
+ *
+ * io.print(st.mjd_to_unix(40587.0))                  # 0.0 — the Unix epoch again
+ * @endcode
  */
 auto mjd_to_unix(TimeInput auto&& mjd) {
     return jd_to_unix(mjd_to_jd(mjd));
@@ -199,7 +272,14 @@ auto mjd_to_unix(TimeInput auto&& mjd) {
  * @return seconds since 2000-01-01T12:00:00.
  * @complexity O(n).
  * @alloc one result array for an ndarray; none for a scalar.
- * @test SpaceTime.J2000
+ * @systest systests/test_j2000.purr
+ * @par Example
+ * @code{.purr}
+ * import io
+ * import space.time as st
+ *
+ * io.print(st.jd_to_j2000_seconds(2451546.0))        # 86400.0 — one day after J2000
+ * @endcode
  */
 auto jd_to_j2000_seconds(TimeInput auto&& jd) {
     return (jd - 2451545.0) * 86400.0;
@@ -212,7 +292,15 @@ auto jd_to_j2000_seconds(TimeInput auto&& jd) {
  * @return Julian centuries since J2000.0.
  * @complexity O(n).
  * @alloc one result array for an ndarray; none for a scalar.
- * @test SpaceTime.J2000
+ * @systest systests/test_j2000.purr
+ * @par Example
+ * @code{.purr}
+ * import io
+ * import space.time as st
+ *
+ * # The `T` fed to precession / sidereal-time polynomial series.
+ * io.print(st.jd_to_j2000_centuries(2451545.0 + 36525.0))   # 1.0 — one Julian century
+ * @endcode
  */
 auto jd_to_j2000_centuries(TimeInput auto&& jd) {
     return (jd - 2451545.0) / 36525.0;
@@ -226,7 +314,16 @@ auto jd_to_j2000_centuries(TimeInput auto&& jd) {
  * @return the CDF_EPOCH value(s) in milliseconds.
  * @complexity O(n).
  * @alloc one result array for an ndarray; none for a scalar.
- * @test SpaceTime.CdfEpoch
+ * @systest systests/test_cdf_epoch.purr
+ * @systest systests/test_vectorized.purr
+ * @par Example
+ * @code{.purr}
+ * import io
+ * import space.time as st
+ *
+ * # J2000 as a CDF_EPOCH — ready to write into a CDF epoch variable.
+ * io.print(st.unix_to_cdf_epoch(946728000.0))        # 63113947200000.0
+ * @endcode
  */
 auto unix_to_cdf_epoch(TimeInput auto&& seconds) {
     return seconds * 1000.0 + 62167219200000.0;
@@ -238,7 +335,15 @@ auto unix_to_cdf_epoch(TimeInput auto&& seconds) {
  * @return seconds since the Unix epoch.
  * @complexity O(n).
  * @alloc one result array for an ndarray; none for a scalar.
- * @test SpaceTime.CdfEpoch
+ * @systest systests/test_cdf_epoch.purr
+ * @par Example
+ * @code{.purr}
+ * import io
+ * import space.time as st
+ *
+ * # An epoch read from a CDF file, back onto the Unix scale.
+ * io.print(st.cdf_epoch_to_unix(63113947200000.0))   # 946728000.0 — J2000
+ * @endcode
  */
 auto cdf_epoch_to_unix(TimeInput auto&& ms) {
     return (ms - 62167219200000.0) / 1000.0;

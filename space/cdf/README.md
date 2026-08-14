@@ -39,5 +39,5 @@ let t = f.var("Epoch").records(0, 1000)    # ndarray, decoded once
 
 ## House rules
 
-Every function documents `@complexity`, `@alloc`, `@test`/`@systest`, and — because a
+Every function documents `@complexity`, `@alloc`, truthful `@systest` tags, and — because a
 reference exists — `@perf` stating the speedup over NASA's C lib.

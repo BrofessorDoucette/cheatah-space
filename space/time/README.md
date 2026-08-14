@@ -52,6 +52,13 @@ exact half-days (Unix epoch, J2000) convert exactly.
 
 ## Tests
 
-Exercised from cheatah in [../../tests/](../../tests/) (`import space.time`), run by the
-[qa_gate](../../scripts/qa_gate.sh). Every public function carries `@complexity`, `@alloc`,
-and `@test`; `@perf` is reserved for the benchmarked modules (cdf/irbem).
+Two layers, both run by the [qa_gate](../../scripts/qa_gate.sh):
+
+- **System tests** — cheatah programs in [../../systests/](../../systests/) that
+  `import space.time` end to end through purrc + the runtime.
+- **Unit tests** — GoogleTest in [../../tests/](../../tests/), held to **100% lines +
+  functions** clang source-based coverage over this header.
+
+Every public function carries `@complexity`, `@alloc`, truthful `@systest` tags naming the
+systests that cover it, and an `@par Example` whose `@code{.purr}` block the gate compiles;
+`@perf` is reserved for the benchmarked modules (cdf/irbem).

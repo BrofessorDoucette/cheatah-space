@@ -38,5 +38,5 @@ numbers and beat its speed. Skipped automatically when IRBEM isn't present.
 
 ## House rules
 
-Every function documents `@complexity`, `@alloc`, `@test`/`@systest`, and `@perf` (speedup vs
+Every function documents `@complexity`, `@alloc`, truthful `@systest` tags, and `@perf` (speedup vs
 IRBEM). Models cite their source paper/coefficients in a brief comment.
