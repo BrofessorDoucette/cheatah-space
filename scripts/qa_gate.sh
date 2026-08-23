@@ -165,6 +165,15 @@ fi
 bold "Running cppcheck (performance + security)…"
 bash scripts/cppcheck.sh || fail "cppcheck (performance/security findings)"
 
+# clang-tidy (static analysis): broad checks from the committed .clang-tidy (a verbatim copy
+# of cheatah's — byte-compared by the driver); cert-* is always fatal, TIDY_WERROR is this
+# repo's burn-down ratchet. Policy lives in the config, mechanics in the canonical driver —
+# neither is forked here.
+bold "Running clang-tidy (cert fatal; ratchet: ${TIDY_WERROR:-cert-* only})…"
+[ -f "$CHEATAH_DIR/scripts/clang_tidy.sh" ] || fail "canonical clang_tidy.sh not found (set CHEATAH_DIR)"
+TIDY_BUILD_DIR=build/debug TIDY_SOURCE_RE='/(space|tests)/' bash "$CHEATAH_DIR/scripts/clang_tidy.sh" || fail "clang-tidy"
+
+
 # 10. Private-reference scan (hard gate): this repo is public — no sibling-project names --------
 bold "Scanning for private-project references…"
 bash scripts/check_no_private_refs.sh || fail "a private-project reference is in the tree"
