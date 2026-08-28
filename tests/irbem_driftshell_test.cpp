@@ -587,7 +587,7 @@ TEST(IrbemDriftShell, MatchesTheOracleAtIrbemDefaultResolution) {
         << "the whole point of not reproducing IRBEM's quadrature";
 }
 
-TEST(IrbemDriftShell, MatchesTheOracleAtIrbemHighestResolution) {
+TEST(IrbemDriftShell, HeavyDifferentialMatchesTheOracleAtIrbemHighestResolution) {
     const Epoch e = standard_epoch();
     const ib::DriftShellOptions opt = ib::DriftShellOptions::from_irbem(9, 9);
     double worst = 0.0;
@@ -605,7 +605,7 @@ TEST(IrbemDriftShell, MatchesTheOracleAtIrbemHighestResolution) {
 
 // Shell splitting: same point, six pitch angles, `I` spanning 0.002 to 11.6 and `B_m` a factor of
 // fifteen. This is what fails if the shell conserves only one of the two invariants.
-TEST(IrbemDriftShell, ShellSplittingMatchesTheOracleAcrossPitchAngles) {
+TEST(IrbemDriftShell, HeavyDifferentialShellSplittingMatchesTheOracleAcrossPitchAngles) {
     const Epoch e = standard_epoch();
     const ib::DriftShellOptions opt = ib::DriftShellOptions::from_irbem(9, 9);
     double worst = 0.0;
@@ -623,7 +623,7 @@ TEST(IrbemDriftShell, ShellSplittingMatchesTheOracleAcrossPitchAngles) {
 
 // The epoch sweep is the control on `k₀`: the dipole moment falls ~6 % from 1900 to 2029 and
 // L ∝ M^(1/3), so a hard-coded moment would show up here as a systematic drift with year.
-TEST(IrbemDriftShell, EpochSweepMatchesTheOracle) {
+TEST(IrbemDriftShell, HeavyDifferentialEpochSweepMatchesTheOracle) {
     const ib::DriftShellOptions opt = ib::DriftShellOptions::from_irbem(9, 9);
     double worst = 0.0;
     double moment_span = 0.0;
@@ -825,7 +825,7 @@ constexpr std::array<HardPoint, 11> kOracleHardRes9{{
     {"tilt42", 4.0, 2.0, -2.0, 6.1254896, 6.1231754, 3.6136239, 308.926811},
 }};
 
-TEST(IrbemDriftShell, MatchesTheOracleOffTheEquatorAndOffTheEasternHemisphere) {
+TEST(IrbemDriftShell, HeavyDifferentialMatchesTheOracleOffTheEquatorAndOffTheEasternHemisphere) {
     const Epoch e = standard_epoch();
     const ib::DriftShellOptions opt = ib::DriftShellOptions::from_irbem(9, 9);
     double worst = 0.0;
@@ -859,7 +859,7 @@ TEST(IrbemDriftShell, MatchesTheOracleOffTheEquatorAndOffTheEasternHemisphere) {
 // So the fix, when a caller needs the 0.01 budget off the equator, is one field on the options
 // struct and not a change of algorithm — and it costs a factor of two in trace time, which is why
 // it is not the default.
-TEST(IrbemDriftShell, LargeOffEquatorialDeviationsAreTheTraceStep) {
+TEST(IrbemDriftShell, HeavyDifferentialLargeOffEquatorialDeviationsAreTheTraceStep) {
     const Epoch e = standard_epoch();
     const HardPoint& p = kOracleHardRes9[2];   // S-y4, the worst of the eleven
     double previous = 1.0;
@@ -905,7 +905,7 @@ TEST(IrbemDriftShell, LargeOffEquatorialDeviationsAreTheTraceStep) {
 // L* survives all three because the root-find matches `I(r)` against `I0` computed the SAME way:
 // the two errors are correlated and largely divide out. That is the substance of the claim, and it
 // is why the shell is good to 1e-3 while the invariant it is built on is good to 1e-2.
-TEST(IrbemDriftShell, ReportsTheDiagnosticFieldsIrbemDoesAndSaysHowCloselyTheyAgree) {
+TEST(IrbemDriftShell, HeavyDifferentialReportsTheDiagnosticFieldsIrbemDoesAndSaysHowCloselyTheyAgree) {
     const Epoch e = standard_epoch();
     const ib::DriftShellOptions opt = ib::DriftShellOptions::from_irbem(9, 9);
     double worst_lm = 0.0;
@@ -941,7 +941,7 @@ TEST(IrbemDriftShell, ReportsTheDiagnosticFieldsIrbemDoesAndSaysHowCloselyTheyAg
 // Transcribed from `make_lstar_shell_splitting1_` at options = {1,0,9,9,0}, kext = 0, 2015-180
 // 12:00 UT: at (4,0,0) GEO it returns a shell down to alpha = 10 degrees and BADDATA at 5 and
 // below; at (6,0,-1) it returns one down to 5 degrees and BADDATA at 3 and below.
-TEST(IrbemDriftShell, RefusesTheLossConeWhereIrbemDoes) {
+TEST(IrbemDriftShell, HeavyDifferentialRefusesTheLossConeWhereIrbemDoes) {
     const Epoch e = standard_epoch();
     const ib::DriftShellOptions opt = ib::DriftShellOptions::from_irbem(9, 9);
     struct Case {

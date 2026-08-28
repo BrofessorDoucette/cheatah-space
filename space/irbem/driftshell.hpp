@@ -184,7 +184,7 @@
  * THE SAME WAY, so the two errors are correlated and largely divide out — which is why the shell
  * is good to 10⁻³ while the invariant it is built on is good to 10⁻². Stated here rather than
  * left to be discovered, and asserted at the measured level by
- * `IrbemDriftShell.ReportsTheDiagnosticFieldsIrbemDoesAndSaysHowCloselyTheyAgree`.
+ * `IrbemDriftShell.HeavyDifferentialReportsTheDiagnosticFieldsIrbemDoesAndSaysHowCloselyTheyAgree`.
  *
  * **Cost**, milliseconds per L\* point at IRBEM's default resolution, same machine, same run,
  * ~220 traces per point either way (RTX 3070 Ti; host lane `-O3 -march=native -ffp-contract=off`):
