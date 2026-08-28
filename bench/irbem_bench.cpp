@@ -1454,7 +1454,7 @@ void BM_cpu_dipole_field_host_batch(benchmark::State& state) {
     }
     set_points(state, kBatch);
 }
-BENCHMARK(BM_cpu_dipole_field_host_batch)->Unit(benchmark::kMillisecond);
+BENCHMARK(BM_cpu_dipole_field_host_batch)->Unit(benchmark::kMillisecond)->UseRealTime();
 
 /// `dipole_field_gpu` — the device lane through `dispatch.hpp`, transfers INCLUDED.
 ///
@@ -1488,7 +1488,7 @@ void BM_gpu_dipole_field_batch(benchmark::State& state) {
     }
     set_points(state, kBatch);
 }
-BENCHMARK(BM_gpu_dipole_field_batch)->Unit(benchmark::kMillisecond);
+BENCHMARK(BM_gpu_dipole_field_batch)->Unit(benchmark::kMillisecond)->UseRealTime();
 
 // ---------------------------------------------------------------------------------------------
 // lstar.hpp — the trace, the second invariant, and the CROSSOVER the module argues from
@@ -1516,11 +1516,35 @@ struct TraceInputs {
     std::vector<Status> statuses;              ///< kTraceMax per-line statuses.
 };
 
+/// The van der Corput radical inverse in base 2 — bit-reversal, read as a fraction of 1.
+///
+/// This is what makes the crossover sweep honest. The obvious `i/N` sweep would give the 64-line
+/// batch nothing but L = 2 shells and the 65536-line batch the whole L = 2…8 range, so the two
+/// batches would be tracing DIFFERENT physics and the ratio between them would be part input-set
+/// artefact. The radical inverse is stratified in every prefix: the first 64 values already cover
+/// [0, 1) evenly, and so do the first 65536. Every point of the crossover curve therefore traces
+/// the same distribution of field lines, and the only thing that changes along it is the batch
+/// size — which is the whole claim the curve makes.
+///
+/// @param i the index.
+/// @return the radical inverse of @p i in `[0, 1)`.
+/// @complexity O(1) — one bit reversal.
+/// @alloc none.
+constexpr double radical_inverse_base2(std::uint32_t i) {
+    i = (i << 16U) | (i >> 16U);
+    i = ((i & 0x00FF00FFU) << 8U) | ((i & 0xFF00FF00U) >> 8U);
+    i = ((i & 0x0F0F0F0FU) << 4U) | ((i & 0xF0F0F0F0U) >> 4U);
+    i = ((i & 0x33333333U) << 2U) | ((i & 0xCCCCCCCCU) >> 2U);
+    i = ((i & 0x55555555U) << 1U) | ((i & 0xAAAAAAAAU) >> 1U);
+    return static_cast<double>(i) * 2.3283064365386963e-10;   // 2^-32
+}
+
 /// Build the trace input set.
 ///
-/// Deterministic, and deliberately incommensurate: the L sweep steps by one 1/kTraceMax of the
-/// range while longitude advances by a golden-ratio turn, so no two lines share a meridian and the
-/// set does not degenerate into a handful of repeated traces the cache would flatter.
+/// Deterministic, and stratified rather than swept: see @ref radical_inverse_base2 for why any
+/// prefix of this set has to look like the whole of it. Longitude advances by a golden-ratio turn
+/// on top, so no two lines share a meridian and the set never degenerates into a handful of
+/// repeated traces the cache would flatter.
 ///
 /// @return the populated set; a function-local static, built on first use.
 /// @complexity O(kTraceMax).
@@ -1534,7 +1558,7 @@ const TraceInputs& trace_inputs() {
         in->statuses.resize(kTraceMax);
         constexpr double kGoldenTurn = 2.399963229728653;  // 2 pi (2 - phi), radians
         for (std::size_t i = 0; i < kTraceMax; ++i) {
-            const double t = static_cast<double>(i) / static_cast<double>(kTraceMax);
+            const double t = radical_inverse_base2(static_cast<std::uint32_t>(i));
             const double l_shell = 2.0 + (6.0 * t);
             const double lon = static_cast<double>(i) * kGoldenTurn;
             // Start on the dipole equator of the shell: r = L, latitude 0. The trace's first stage
@@ -1604,13 +1628,24 @@ void BM_cpu_dipole_moment(benchmark::State& state) {
 }
 BENCHMARK(BM_cpu_dipole_moment);
 
-/// The batch sizes the crossover sweep visits.
+/// The batch sizes the crossover sweep visits, and the units both its lanes report in.
+///
+/// REAL time, not CPU time. A device lane spends nearly all of its wall clock blocked in
+/// `vkQueueWaitIdle` and almost none of it on a core, so Google Benchmark's default CPU-time
+/// accounting would credit the device with a throughput several times its actual one — the exact
+/// error that makes a GPU claim worthless. The host lane reports real time too, so the ratio
+/// between them is a ratio of the same quantity.
+///
+/// The repetition count and minimum time are deliberately NOT set here: Google Benchmark writes
+/// `->MinTime` into the benchmark's NAME, and a name that moves when the harness is retuned breaks
+/// every join between the manifest and the JSON. `scripts/bench_run.sh` passes them on the command
+/// line instead.
 /// @param b the benchmark to attach them to.
 /// @complexity O(1).
 /// @alloc Google Benchmark's argument vector.
 void crossover_sizes(benchmark::Benchmark* b) {
     for (std::int64_t n = 64; n <= static_cast<std::int64_t>(kTraceMax); n *= 4) b->Arg(n);
-    b->Unit(benchmark::kMicrosecond)->MinTime(0.2)->UseRealTime();
+    b->Unit(benchmark::kMicrosecond)->UseRealTime();
 }
 
 /// The HOST lane of the batch tracer: exactly the loop `trace_invariant_batch` falls back to.
@@ -1823,7 +1858,7 @@ void BM_cpu_igrf_batch(benchmark::State& state) {
     }
     set_points(state, kIgrfBatch);
 }
-BENCHMARK(BM_cpu_igrf_batch)->Unit(benchmark::kMillisecond);
+BENCHMARK(BM_cpu_igrf_batch)->Unit(benchmark::kMillisecond)->UseRealTime();
 
 #ifdef CHEATAH_SPACE_IRBEM_LSTAR_GPU
 /// Launch `irbem_igrf_f32` — a launcher this benchmark has to own, because the seam has none.
@@ -1893,7 +1928,7 @@ void BM_gpu_igrf_batch(benchmark::State& state) {
     state.SkipWithError("built without cheatah-gpu-linalg on the include path");
 #endif
 }
-BENCHMARK(BM_gpu_igrf_batch)->Unit(benchmark::kMillisecond);
+BENCHMARK(BM_gpu_igrf_batch)->Unit(benchmark::kMillisecond)->UseRealTime();
 
 // ---------------------------------------------------------------------------------------------
 // The manifest — which lane exists for which routine, DERIVED, never asserted
@@ -1960,9 +1995,10 @@ constexpr std::array<Routine, 45> kRoutines{{
     {"igrf: Igrf<13>::at (per epoch)", "BM_cpu_igrf_at_deg13", nullptr, nullptr, nullptr},
     {"igrf: evaluate, degree 13, GEO", "BM_cpu_igrf_evaluate_deg13", nullptr,
      "BM_irbem_get_field_igrf", "irbem_igrf_f32"},
-    {"igrf: evaluate, batch of 65536", "BM_cpu_igrf_batch", "BM_gpu_igrf_batch",
+    {"igrf: evaluate, batch of 65536", "BM_cpu_igrf_batch/real_time",
+     "BM_gpu_igrf_batch/real_time",
      "BM_irbem_get_field_igrf", "irbem_igrf_f32"},
-    {"dipole: batch, fp32", "BM_cpu_dipole_field_host_batch", "BM_gpu_dipole_field_batch",
+    {"dipole: batch, fp32", "BM_cpu_dipole_field_host_batch/real_time", "BM_gpu_dipole_field_batch/real_time",
      "BM_irbem_get_field_dipole", "irbem_dipole_f32"},
 
     {"lstar: trace_invariant (one line)", "BM_cpu_trace_invariant", nullptr,
@@ -2122,11 +2158,11 @@ void print_intensity() {
     const std::array<Intensity, 3> rows{{
         // 3 floats in, 3 floats out.
         {"irbem_dipole_f32", "centred dipole", 24.0, kFlopsPerDipoleEval,
-         "BM_cpu_dipole_field_host_batch", "BM_gpu_dipole_field_batch"},
+         "BM_cpu_dipole_field_host_batch/real_time", "BM_gpu_dipole_field_batch/real_time"},
         // 3 floats in, 3 floats out. The coefficient and normalisation tables are 1736 bytes for
         // the WHOLE batch — 0.03 bytes/point at 65536 — so they do not appear here.
-        {"irbem_igrf_f32", "IGRF-14, degree 13", 24.0, kFlopsPerIgrfEval, "BM_cpu_igrf_batch",
-         "BM_gpu_igrf_batch"},
+        {"irbem_igrf_f32", "IGRF-14, degree 13", 24.0, kFlopsPerIgrfEval,
+         "BM_cpu_igrf_batch/real_time", "BM_gpu_igrf_batch/real_time"},
         // 3 position floats + 1 pitch float in = 16; 4 result floats + 1 status word out = 20.
         {"irbem_trace_i_f32", "trace + second invariant", 36.0,
          kIgrfEvalsPerRk4Step * steps * kFlopsPerIgrfEval, "BM_cpu_trace_batch/65536/real_time",

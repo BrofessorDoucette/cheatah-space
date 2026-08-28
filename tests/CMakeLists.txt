@@ -46,6 +46,7 @@ add_executable(cheatah_space_tests
     alloc_counter.cpp
     space_time_test.cpp
     space_civil_test.cpp
+    space_calendar_reform_test.cpp
     space_cdf_leapseconds_test.cpp
     irbem_frames_test.cpp
     irbem_policy_test.cpp
