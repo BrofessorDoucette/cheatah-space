@@ -1,0 +1,57 @@
+# space.time — the proleptic Gregorian calendar, exercised through the imported library.
+#
+# The in-process C++ suite (tests/space_civil_test.cpp) sweeps all 213,505 days of the TT2000
+# range. This checks the same surface end-to-end through purrc and the cheatah runtime, which
+# is the part that proves a researcher writing `import space.time` actually gets these.
+import io
+import space.time as st
+import check
+
+io.print("== space.time: civil calendar ==")
+let f = 0
+
+# leap-year rules, all three arms
+f += check.is_true("2000 is a leap year (/400)", st.is_leap_year(2000))
+f += check.is_true("1900 is not (/100, not /400)", st.is_leap_year(1900) == false)
+f += check.is_true("2024 is a leap year (/4)", st.is_leap_year(2024))
+f += check.is_true("2026 is not", st.is_leap_year(2026) == false)
+
+# month lengths
+f += check.int_eq("Feb 2024", st.days_in_month(2024, 2), 29)
+f += check.int_eq("Feb 2026", st.days_in_month(2026, 2), 28)
+f += check.int_eq("Dec", st.days_in_month(2026, 12), 31)
+f += check.int_eq("month 0 is rejected", st.days_in_month(2026, 0), 0)
+f += check.int_eq("month 13 is rejected", st.days_in_month(2026, 13), 0)
+
+# day numbers — exact, no tolerance
+f += check.int_eq("1970-01-01 is day 0", st.days_from_civil(1970, 1, 1), 0)
+f += check.int_eq("1969-12-31 is day -1", st.days_from_civil(1969, 12, 31), 0 - 1)
+f += check.int_eq("2000-01-01 is day 10957", st.days_from_civil(2000, 1, 1), 10957)
+f += check.int_eq("2024-02-29 is day 19782", st.days_from_civil(2024, 2, 29), 19782)
+
+# the struct crosses the module boundary and carries its fields
+let d = st.civil_from_days(10957)
+f += check.int_eq("day 10957 -> year", d.year, 2000)
+f += check.int_eq("day 10957 -> month", d.month, 1)
+f += check.int_eq("day 10957 -> day", d.day, 1)
+
+let made = st.civil_date(2026, 8, 28)
+f += check.int_eq("civil_date keeps year", made.year, 2026)
+f += check.int_eq("civil_date keeps month", made.month, 8)
+f += check.int_eq("civil_date keeps day", made.day, 28)
+f += check.is_true("2026-08-28 is a real date", st.is_valid_civil(made))
+f += check.is_true("2026-02-29 is not", st.is_valid_civil(st.civil_date(2026, 2, 29)) == false)
+
+# NASA's own formula, and the offset that ties it to our day numbers
+f += check.int_eq("JD noon at J2000", st.nasa_julian_day_at_noon(2000, 1, 1), 2451545)
+f += check.int_eq("JD noon at the Unix epoch", st.nasa_julian_day_at_noon(1970, 1, 1), 2440588)
+
+# a round trip over a spread of days, including negative (pre-1970) ones
+let days = [0 - 719528, 0 - 25000, 0 - 1, 0, 1, 10957, 19782, 100000]
+for z in days {
+    let c = st.civil_from_days(z)
+    f += check.int_eq("round trip", st.days_from_civil(c.year, c.month, c.day), z)
+    f += check.int_eq("NASA agrees", st.nasa_julian_day_at_noon(c.year, c.month, c.day), z + 2440588)
+}
+
+check.result(f)

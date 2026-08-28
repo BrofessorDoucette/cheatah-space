@@ -109,14 +109,14 @@ committed by the gate:
 <!-- coverage:start -->
 | Metric | space package |
 |--------|---------------|
-| **Lines** | 100.00% (33/33) |
-| **Functions** | 100.00% (13/13) |
+| **Lines** | 100.00% (77/77) |
+| **Functions** | 100.00% (20/20) |
 | Regions | 100.00% |
-| Branches | - |
+| Branches | 100.00% |
 <!-- coverage:end -->
 
-(`space.time` is straight-line arithmetic — it has no branches; the Branches metric will
-light up with `space.cdf`.)
+(The Branches metric lit up with `space/time/civil.hpp` — the calendar's leap-year and
+era-shifting arms are the package's first real branches, and all of them are exercised.)
 
 ## License
 

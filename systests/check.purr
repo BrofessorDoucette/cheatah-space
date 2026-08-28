@@ -59,6 +59,27 @@ fn near_eq(name, got, want, tol) {
     return 1
 }
 
+# Assert two integers are EXACTLY equal; print PASS/FAIL, return the failure count (0 or 1).
+#
+# Deliberately not close_eq: day numbers, leap seconds and TT2000 nanoseconds are exact
+# integers, and the defect they fail on is off-by-one. A relative tolerance would pass an
+# answer that is one day, or one second, wrong — which is the only kind of wrong they get.
+#
+# @param name the check's label.
+# @param got the computed value.
+# @param want the expected value.
+# @return 0 on pass, 1 on fail.
+# @complexity O(1).
+# @alloc none.
+fn int_eq(name, got, want) {
+    if got == want {
+        io.print("  PASS", name)
+        return 0
+    }
+    io.print("  FAIL", name, "got", got, "want", want)
+    return 1
+}
+
 # Assert a boolean condition; print PASS/FAIL, return the failure count (0 or 1).
 #
 # @param name the check's label.
