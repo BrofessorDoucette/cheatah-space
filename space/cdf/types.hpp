@@ -35,7 +35,7 @@ namespace cheatah::space::cdf {
 inline constexpr std::uint32_t kMagicV3 = 0xCDF30001U;
 /// First magic number of a CDF 2.6/2.7 file — the 32-bit-offset generation.
 inline constexpr std::uint32_t kMagicV26 = 0xCDF26002U;
-/// First magic number of a pre-2.6 file. Deliberately not supported; see ErrorCode::UnsupportedPreV26.
+/// First magic number of a pre-2.6 file. Not supported; see ErrorCode::UnsupportedPreV26.
 inline constexpr std::uint32_t kMagicPreV26 = 0x0000FFFFU;
 /// Second magic number: the file's records are stored uncompressed.
 inline constexpr std::uint32_t kMagicUncompressed = 0x0000FFFFU;
@@ -329,6 +329,21 @@ constexpr EncodingClass encoding_class_of(Encoding encoding) noexcept {
 }
 
 /**
+ * Whether an encoding value is one the format defines. Every code 1..21 is assigned, so this is
+ * a range check — but a corrupt CDR can hold anything, and encoding_class_of() must not be the
+ * thing that discovers it.
+ * @param encoding the value read from a CDR.
+ * @return true when the format defines it.
+ * @complexity O(1).
+ * @alloc none.
+ */
+constexpr bool is_known_encoding(Encoding encoding) noexcept {
+    const auto v = static_cast<std::int32_t>(encoding);
+    return v >= static_cast<std::int32_t>(Encoding::Network)
+           && v <= static_cast<std::int32_t>(Encoding::Ia64VmsG);
+}
+
+/**
  * The name of a decode class, for diagnostics.
  * @param cls a decode class.
  * @return a short lowercase name.
@@ -455,11 +470,13 @@ enum class ErrorCode : std::uint8_t {
     CannotOpen,           ///< The file could not be opened.
     CannotMap,            ///< The file could not be memory-mapped.
     EmptyFile,            ///< The file is too small to contain even the magic numbers.
+    UnsupportedLayout,    ///< An N-D variable in a column-major file; the transpose is not in yet.
+    UnsupportedEncoding,  ///< A VAX float encoding; the conversion is not in yet.
 };
 
 /// How many ErrorCode enumerators exist, including None. The unit tests assert one crafted
 /// failure per code against this, so a new code cannot be added without a test that provokes it.
-inline constexpr std::size_t kErrorCodeCount = 25;
+inline constexpr std::size_t kErrorCodeCount = 27;
 
 namespace detail {
 
@@ -474,7 +491,7 @@ constexpr std::string_view error_message(ErrorCode code) noexcept {
     switch (code) {
         case ErrorCode::None: return "no error";
         case ErrorCode::NotCdf: return "not a CDF file (bad magic number)";
-        case ErrorCode::UnsupportedPreV26: return "pre-2.6 CDF files are not supported";
+        case ErrorCode::UnsupportedPreV26: return "CDF 2.x files are not supported yet";
         case ErrorCode::TruncatedFile: return "file ends in the middle of a record";
         case ErrorCode::BadMagic: return "second magic number is neither uncompressed nor compressed";
         case ErrorCode::BadRecordType: return "undefined record type";
@@ -497,6 +514,8 @@ constexpr std::string_view error_message(ErrorCode code) noexcept {
         case ErrorCode::CannotOpen: return "cannot open the file";
         case ErrorCode::CannotMap: return "cannot memory-map the file";
         case ErrorCode::EmptyFile: return "file is too small to be a CDF";
+        case ErrorCode::UnsupportedLayout: return "multi-dimensional column-major variables are not supported yet";
+        case ErrorCode::UnsupportedEncoding: return "VAX floating-point encodings are not supported yet";
     }
     return "unknown error";
 }

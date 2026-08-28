@@ -110,10 +110,10 @@ committed by the gate:
 <!-- coverage:start -->
 | Metric | space package |
 |--------|---------------|
-| **Lines** | 100.00% (3044/3044) |
-| **Functions** | 100.00% (334/334) |
-| Regions | 98.68% |
-| Branches | 93.53% |
+| **Lines** | 100.00% (3447/3447) |
+| **Functions** | 100.00% (365/365) |
+| Regions | 98.74% |
+| Branches | 93.73% |
 <!-- coverage:end -->
 
 (`space.time` is straight-line arithmetic — it has no branches; the Branches metric will
