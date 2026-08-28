@@ -1,0 +1,55 @@
+# cheatah-space CDF differential corpus — the pinned, hash-verified reference files.
+#
+# Columns (tab-separated):  tier  file  url  sha256  bytes  tags
+#
+# WHAT THIS IS. The files space.cdf is verified against, byte for byte, using NASA's own library
+# as the oracle. Every row was fetched and hashed on 2026-08-28; every tag was DERIVED from the
+# file by `scripts/cdf-corpus.sh probe` (which reads it with cdfdump), not typed by hand. Re-run
+# probe after adding a row — a hand-written tag is a claim, a derived one is a measurement.
+#
+# The files themselves are NEVER committed. They live in the .gitignore'd
+# space/cdf/vendor/corpus/ and are fetched on demand. This manifest is the committed part: it is
+# what makes the corpus reproducible and what makes "the file changed upstream" detectable.
+#
+# TIERS
+#   tier0  ~3.0 MB   unit fixtures. Always fetched. Small enough to run in seconds.
+#   tier1  ~68 MB    real mission data. The correctness sweep.
+#   tier2  ~470 MB   large files, benchmarks only. Never in the default oracle ctest.
+#
+# THE GAP THIS CORPUS CANNOT CLOSE. Not one file in NASA's public archive uses RLE, Huffman,
+# adaptive Huffman, or whole-file (CCR) compression — verified across all 16 rows below, where
+# every compressed variable is GZIP. Those four code paths are therefore covered only by tier3,
+# which `scripts/cdf-corpus.sh derive` GENERATES locally with NASA's cdfconvert. Tier3 is not
+# listed here: its hashes depend on the oracle build, so it carries its own generated manifest.
+# There is likewise no VAX-encoded file anywhere in the archive; see the tier3 notes.
+#
+# TAG VOCABULARY
+#   v3 | v2.6 | pre-v2.6      on-disk format generation, read from the magic number.
+#                             pre-v2.6 is present so the REJECTION path has a real fixture.
+#   network | ibmpc | ...     encoding, i.e. the byte order values are stored in.
+#   row | column              majority.
+#   checksum                  the file carries the trailing 16-byte MD5.
+#   var-gzip | var-rle | ...  per-variable compression actually present in the file.
+#   ccr-*                     whole-file compression (none exist in the wild; see above).
+#   epoch | epoch16 | tt2000  which of the three time types appear.
+#   char                      CDF_CHAR/CDF_UCHAR variables or attribute entries.
+#   sparse-pad | sparse-prev  sparse record variables, and which fill rule.
+#   rvars | zvars             rVariables and/or zVariables present.
+#   multifile                 data lives in .v0/.z0 companion files rather than one dotCDF.
+tier	file	url	sha256	bytes	tags
+tier0	a1_k0_mpa_20050804_v02.cdf	https://spdf.gsfc.nasa.gov/pub/software/cdf/cdf_test_files/a1_k0_mpa_20050804_v02.cdf	a874f80066b9ca7bda571d4318430f0e0e01413554c864ed99116189c6605403	214528	v2.6,network,column,epoch,char,rvars
+tier0	bigcdf_compressed.cdf	https://spdf.gsfc.nasa.gov/pub/software/cdf/cdf_test_files/bigcdf_compressed.cdf	f893f7fc4b0f60ce6431c85d863854f46b64eaabc8f6eb4f16c15e1367645db7	2479092	v3,ibmpc,row,var-gzip,zvars
+tier0	c1_waveform_wbd_200202080940_v01_subset.cdf	https://spdf.gsfc.nasa.gov/pub/software/cdf/cdf_test_files/c1_waveform_wbd_200202080940_v01_subset.cdf	326e64c8d3e57fa6df379a19bf415396f3e006e5da301a38fa4ae9ee6335b0d9	42524	v3,network,row,checksum,var-gzip,epoch16,char,zvars
+tier0	cl_sp_edi_00000000_v01.cdf	https://spdf.gsfc.nasa.gov/pub/software/cdf/cdf_test_files/cl_sp_edi_00000000_v01.cdf	b52b3b2d22dbca8cf97779684ba35f45ada608da31044d6960bd2bd038b161b3	19099	v2.6,network,row,epoch,char,zvars
+tier0	ge_k0_cpi_19921231_v02.cdf	https://spdf.gsfc.nasa.gov/pub/software/cdf/cdf_test_files/ge_k0_cpi_19921231_v02.cdf	fa17799487d583b8b452fe18844bf0ca7b027763365bed51a039fced58970460	148480	pre-v2.6,network,column,epoch,char,rvars
+tier0	test_alltypes.cdf	https://spdf.gsfc.nasa.gov/pub/software/cdf/cdf_test_files/test_alltypes.cdf	762007a07ce46c51ef043bada97243a37f7690bb77ed81fd29b662068f99da8b	117066	v3,ibmpc,row,checksum,var-gzip,epoch16,epoch,tt2000,char,sparse-pad,zvars
+tier1	omni_hro2_1min_20150101_v01.cdf	https://spdf.gsfc.nasa.gov/pub/data/omni/omni_cdaweb/hro2_1min/2015/omni_hro2_1min_20150101_v01.cdf	8c6dabb1969f7ad6dc9e671348cabba2ea949ccc0dc98f787b892f7b366b4b94	8774208	v3,network,row,epoch,char,zvars
+tier1	rbsp-a_density_emfisis-l4_20130101_v1.5.17.cdf	https://spdf.gsfc.nasa.gov/pub/data/rbsp/rbspa/l4/emfisis/density/2013/rbsp-a_density_emfisis-l4_20130101_v1.5.17.cdf	5b0933e30257683df47c8b3829f580d1b326540f4fd7351448978957855f3760	242256	v3,network,row,checksum,var-gzip,tt2000,char,zvars
+tier1	rbsp-a_mag-ephem_def-1min-t89d_20130101_v01.cdf	https://spdf.gsfc.nasa.gov/pub/data/rbsp/rbspa/ephemeris/ect-mag-ephem/cdf/def-1min-t89d/2013/rbsp-a_mag-ephem_def-1min-t89d_20130101_v01.cdf	79c7b6579c6c61fccf1c2dab857a2866e9a1776233b4d448d624e151fc01b147	3240269	v3,network,column,epoch,char,zvars
+tier1	rbspa_rel03_ect-rept-sci-l3_20120901_v5.0.0.cdf	https://spdf.gsfc.nasa.gov/pub/data/rbsp/rbspa/l3/ect/rept/sectors/rel03/2012/rbspa_rel03_ect-rept-sci-l3_20120901_v5.0.0.cdf	f39a7f473e31f9735309a9953c6e326f468d404187eb02316d4b0f3a55598c0e	20377695	v3,ibmpc,row,var-gzip,epoch,char,zvars
+tier1	rbspa_rel04_ect-hope-mom-l3_20130101_v7.1.0.cdf	https://spdf.gsfc.nasa.gov/pub/data/rbsp/rbspa/l3/ect/hope/moments/rel04/2013/rbspa_rel04_ect-hope-mom-l3_20130101_v7.1.0.cdf	645698de2410fd4182e192bdddb068c1363873cfcfb64d6eed4399a9aa2f53c7	433405	v3,ibmpc,row,var-gzip,epoch,char,zvars
+tier1	tha_l2_fgm_20150101_v01.cdf	https://spdf.gsfc.nasa.gov/pub/data/themis/tha/l2/fgm/2015/tha_l2_fgm_20150101_v01.cdf	ea6ec9085cd6c7071333a65812435a816536fd1594aee8c60743897abdd4ed86	30149211	v3,network,row,var-gzip,epoch16,epoch,char,sparse-prev,zvars
+tier1	voyager2_48s_mag-vim_20130101_v01.cdf	https://spdf.gsfc.nasa.gov/pub/software/cdf/cdf_test_files/voyager2_48s_mag-vim_20130101_v01.cdf	d7896ca3dce9bcc16031c962ffd1ebb293fefadcec64e464ab203eb47d4fbb2a	5122617	v3,network,column,epoch,char,sparse-prev,zvars
+tier2	c1_waveform_wbd_200202080940_v01.cdf	https://spdf.gsfc.nasa.gov/pub/software/cdf/cdf_test_files/c1_waveform_wbd_200202080940_v01.cdf	9771adcf4c470c03f434a2bcc21f655125d57d094cb85af002f54aa14611d621	252911680	v3,network,row,checksum,var-gzip,epoch16,char,zvars
+tier2	mms1_fgm_srvy_l2_20170101_v5.138.0.cdf	https://spdf.gsfc.nasa.gov/pub/data/mms/mms1/fgm/srvy/l2/2017/01/mms1_fgm_srvy_l2_20170101_v5.138.0.cdf	94ad9437f0372eaca543b8bf9788fd43250ff707434f3f836e361fd984484480	73043409	v3,ibmpc,column,checksum,var-gzip,tt2000,char,zvars
+tier2	rbsp-a_magnetometer_uvw_emfisis-l2_20130101_v1.6.2.cdf	https://spdf.gsfc.nasa.gov/pub/data/rbsp/rbspa/l2/emfisis/magnetometer/uvw/2013/rbsp-a_magnetometer_uvw_emfisis-l2_20130101_v1.6.2.cdf	20e03fc2bea9d12b4bd4035b235da0e4880d29c81e9f30c851fbc3a578094bab	145892325	v3,network,column,checksum,var-gzip,tt2000,char,zvars
