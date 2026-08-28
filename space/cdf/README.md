@@ -5,10 +5,18 @@ NASA **Common Data Format** I/O for cheatah — the format space-physics data sh
 in C++ with zero dependencies**: NASA's CDF library is *not* linked and *not* required to
 build, install, or use `space.cdf`. Goal: the fastest CDF reader/writer we can build.
 
-> Reference: <https://cdf.gsfc.nasa.gov/>. The CDF C distribution is public domain. We use it
-> **only as an optional, dev-only oracle** — to verify our output byte-for-byte and to
-> benchmark against — fetched on demand into `space/cdf/vendor/` (git-ignored) and gated
-> behind a flag. A normal `biome add cheatah-space` never touches it.
+> Reference: <https://cdf.gsfc.nasa.gov/>, and the authoritative
+> [CDF 3.9 Internal Format Description](https://spdf.gsfc.nasa.gov/pub/software/cdf/doc/cdf39/cdf39ifd.pdf).
+> We implement from that specification; we do not read or copy NASA's source.
+>
+> NASA's CDF distribution is **not public domain** — per
+> [CDF_copyright.txt](https://spdf.gsfc.nasa.gov/pub/software/cdf/dist/CDF_copyright.txt) it "may
+> be copied or redistributed as long as it is not sold for profit", may be incorporated into other
+> products, and carries modification-notice requirements. So we use it **only as an optional,
+> dev-only oracle** — to verify our output byte-for-byte and to benchmark against — fetched on
+> demand by `scripts/cdf-oracle.sh` into `space/cdf/vendor/` (git-ignored), never committed, never
+> shipped, and gated behind a flag. `scripts/check_no_vendored_nasa.sh` enforces that on every
+> push. A normal `biome add cheatah-space` never touches any of it.
 
 ## Plan
 

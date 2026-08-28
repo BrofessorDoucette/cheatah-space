@@ -20,6 +20,9 @@
 #   8. Valgrind memcheck (hard gate): run every unit test under Valgrind.
 #   9. cppcheck (hard gate): performance + security static analysis.
 #   10. Private-reference scan (hard gate): no non-public sibling-project names in the tree.
+#   11. Vendored-reference scan (hard gate): the dev-only NASA CDF / IRBEM oracles are never
+#       committed — they are git-ignored, licence-incompatible to redistribute, and keeping
+#       them out is what keeps the from-spec provenance claim checkable.
 #
 # The toolchain (purrc + cheatah runtime + the stdlib sources the C++ tests compile) is the sibling
 # ../cheatah checkout; override with CHEATAH_DIR. Skips (discouraged; for fast local iteration):
@@ -177,6 +180,14 @@ TIDY_BUILD_DIR=build/debug TIDY_SOURCE_RE='/(space|tests)/' bash "$CHEATAH_DIR/s
 # 10. Private-reference scan (hard gate): this repo is public — no sibling-project names --------
 bold "Scanning for private-project references…"
 bash scripts/check_no_private_refs.sh || fail "a private-project reference is in the tree"
+
+# 11. Vendored-reference scan (hard gate): the dev-only oracles stay OUT of the repo ------------
+# space.cdf / space.irbem are implemented from published specs and papers; NASA's CDF library and
+# PRBEM/IRBEM live under space/<mod>/vendor/ as optional, git-ignored, dev-only oracles. Committing
+# either would import an incompatible redistribution term (NASA's CDF is NOT public domain) and
+# would end the clean-room provenance claim. Offline, milliseconds.
+bold "Scanning for vendored reference implementations…"
+bash scripts/check_no_vendored_nasa.sh || fail "a vendored reference implementation is in the tree"
 
 bold "QA gate PASSED — push may proceed."
 exit 0

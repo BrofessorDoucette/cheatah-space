@@ -1,0 +1,37 @@
+# The NASA CDF distribution used as cheatah-space's DEV-ONLY reference oracle.
+#
+# This pin is reviewed, not discovered: scripts/cdf-oracle.sh refuses to fetch anything whose
+# bytes do not hash to CDF_ORACLE_SHA256. NASA re-rolls its tarballs IN PLACE (the 3.9.2 archive
+# was re-dated 2026-08-18 while its release directory is dated 2025-11-06), so a stale pin is an
+# expected event, not a bug — the script tells you exactly which line to replace and prints the
+# new digest for review. It NEVER accepts a changed artifact on its own.
+#
+# NOTE ON LICENSING: the CDF distribution is NOT public domain. Per
+# https://spdf.gsfc.nasa.gov/pub/software/cdf/dist/CDF_copyright.txt it "may be copied or
+# redistributed as long as it is not sold for profit", may be incorporated into other products,
+# and carries modification-notice requirements. Everything this pin fetches therefore lands in
+# space/cdf/vendor/ — which is .gitignore'd — and is NEVER committed and NEVER shipped. We
+# implement space.cdf from the published Internal Format Description, not from NASA's source.
+# scripts/check_no_vendored_nasa.sh enforces that on every push.
+
+CDF_ORACLE_VERSION=cdf39_2
+
+# The VERSIONED path under linux/. Do not use dist/cdf39_2/cdf_dist-cdf.tar.gz — that is a
+# symlink whose target moves when NASA cuts a release.
+CDF_ORACLE_URL=https://spdf.gsfc.nasa.gov/pub/software/cdf/dist/cdf39_2/linux/cdf39_2-dist-cdf.tar.gz
+
+# Verified 2026-08-28 by downloading the artifact and hashing it locally.
+CDF_ORACLE_SHA256=2840428c4f4023e370780844f057eb5ea0e6a627c84c917c3b3f4354da3834a4
+
+# NASA publishes this alongside the tarball as <url>.md5. It is NOT a trust anchor — MD5 is
+# broken, and it travels over the same channel as the artifact. It is used for exactly one
+# thing: telling "NASA re-rolled the release" apart from "these bytes are wrong", so a failure
+# reports the right diagnosis. CDF_ORACLE_SHA256 is the only value that gates anything.
+CDF_ORACLE_MD5=a53f55b80e3a9d4109d9089a7afc5658
+
+# The single top-level directory inside the tarball.
+CDF_ORACLE_TARROOT=cdf39_2-dist-main
+
+# The format specification we implement against. Fetched by hand, read by humans; the oracle
+# binaries settle questions the prose leaves open.
+CDF_ORACLE_SPEC=https://spdf.gsfc.nasa.gov/pub/software/cdf/doc/cdf39/cdf39ifd.pdf
