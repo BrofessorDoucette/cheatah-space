@@ -63,6 +63,7 @@ add_executable(cheatah_space_tests
     irbem_t89_test.cpp
     irbem_trace_api_test.cpp
     irbem_driftshell_test.cpp
+    irbem_total_field_test.cpp
 )
 target_link_libraries(cheatah_space_tests PRIVATE
     cheatah::space

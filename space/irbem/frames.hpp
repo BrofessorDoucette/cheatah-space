@@ -30,6 +30,7 @@
  *       ellipsoid. Mixing those is the same class of bug one level down.
  */
 
+#include <concepts>
 #include <cstdint>
 #include <optional>
 #include <string_view>
@@ -169,6 +170,7 @@ concept CartesianFrame = (kind_of(F) == FrameKind::Cartesian);
 template <Frame F>
 concept AngularFrame = (kind_of(F) != FrameKind::Cartesian);
 
+
 /**
  * A position, in frame @p F.
  *
@@ -295,6 +297,21 @@ struct FieldVector {
     friend constexpr bool operator==(const FieldVector& a, const FieldVector& b) {
         return a.v == b.v;
     }
+};
+
+/**
+ * A magnetic field model that can be asked for `B` at a geographic Cartesian point.
+ *
+ * @ref Igrf satisfies it, and so will an internal-plus-external superposition when the external
+ * models land — which is the point of naming the requirement rather than hard-coding @ref Igrf into
+ * the single-point routines. The batch routines are *not* written against this concept, because the
+ * device lane has to upload a specific model's coefficients and cannot dispatch on a callable.
+ *
+ * @tparam M the candidate model type.
+ */
+template <class M>
+concept GeoFieldModel = requires(const M& model, const Position<Frame::GEO>& p) {
+    { model.evaluate(p) } -> std::same_as<FieldVector<Frame::GEO>>;
 };
 
 }  // namespace cheatah::space::irbem

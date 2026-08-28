@@ -195,20 +195,10 @@
 
 namespace cheatah::space::irbem {
 
-/**
- * A magnetic field model that can be asked for `B` at a geographic Cartesian point.
- *
- * @ref Igrf satisfies it, and so will an internal-plus-external superposition when the external
- * models land — which is the point of naming the requirement rather than hard-coding @ref Igrf into
- * the single-point routines. The batch routines are *not* written against this concept, because the
- * device lane has to upload a specific model's coefficients and cannot dispatch on a callable.
- *
- * @tparam M the candidate model type.
- */
-template <class M>
-concept GeoFieldModel = requires(const M& model, const Position<Frame::GEO>& p) {
-    { model.evaluate(p) } -> std::same_as<FieldVector<Frame::GEO>>;
-};
+// @ref GeoFieldModel moved to frames.hpp: the tracer in lstar.hpp needs it, and this header
+// already sits on top of lstar.hpp, so defining it here would be a cycle. It is written purely in
+// terms of Position and FieldVector, which frames.hpp owns.
+
 
 // ---------------------------------------------------------------------------------------------
 // The finite-difference step

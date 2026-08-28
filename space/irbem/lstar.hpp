@@ -112,8 +112,8 @@ namespace detail {
 /// @return the arrival position.
 /// @complexity Four IGRF evaluations — the RK4 stages — plus one carried in.
 /// @alloc none.
-template <int NMAX>
-[[nodiscard]] inline Position<Frame::GEO> rk4_step(const Igrf<NMAX>& model,
+template <GeoFieldModel M>
+[[nodiscard]] inline Position<Frame::GEO> rk4_step(const M& model,
                                                    const Position<Frame::GEO>& p,
                                                    const fixarray::vec3d& b_here, double ds,
                                                    fixarray::vec3d& b_next) {
@@ -181,8 +181,8 @@ namespace detail {
 /// @return the partial integral; @p steps receives the count, and @p closed whether a mirror point
 ///         was actually reached rather than the step cap or the atmosphere.
 /// @complexity O(steps) IGRF evaluations. @alloc none.
-template <int NMAX>
-[[nodiscard]] inline double half_invariant(const Igrf<NMAX>& model,
+template <GeoFieldModel M>
+[[nodiscard]] inline double half_invariant(const M& model,
                                             const Position<Frame::GEO>& from,
                                             const fixarray::vec3d& b_from, double b_mirror,
                                             double ds, const TraceOptions& opt, int& steps,
@@ -244,8 +244,8 @@ template <int NMAX>
  * @alloc none — the integral accumulates in registers and no path is stored.
  * @test IrbemLstar.DipoleTraceMatchesTheAnalyticInvariant
  */
-template <int NMAX>
-[[nodiscard]] inline Result<FieldLine> trace_invariant(const Igrf<NMAX>& model,
+template <GeoFieldModel M>
+[[nodiscard]] inline Result<FieldLine> trace_invariant(const M& model,
                                                        const Position<Frame::GEO>& start,
                                                        double pitch_angle_deg,
                                                        const TraceOptions& opt = {}) {
