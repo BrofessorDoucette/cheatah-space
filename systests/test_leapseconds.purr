@@ -1,0 +1,61 @@
+# space.cdf — NASA's leap-second table, exercised through the imported library.
+#
+# The in-process C++ suite pins the table's shape and the exact-vs-NASA divergence day by day.
+# This checks the same surface end-to-end through purrc and the cheatah runtime — the part that
+# proves a researcher writing `import space.cdf` actually gets these.
+import io
+import space.cdf as cdf
+import check
+
+io.print("== space.cdf: leap seconds ==")
+let f = 0
+
+# the table's shape
+f += check.int_eq("42 entries", cdf.leap_second_count(), 42)
+f += check.int_eq("14 drift rows (NASA's NERA1)", cdf.leap_second_drift_rows(), 14)
+
+# the first and last entries, read as structs across the module boundary
+let first = cdf.leap_second_entry(0)
+f += check.int_eq("first entry year", first.year, 1960)
+f += check.int_eq("first entry month", first.month, 1)
+f += check.int_eq("first entry day", first.day, 1)
+
+let last = cdf.leap_second_entry(41)
+f += check.int_eq("last entry year", last.year, 2017)
+f += check.int_eq("last entry is 37 s", last.delta_at_e7, 370000000)
+f += check.int_eq("last entry does not drift", last.drift_rate_e7, 0)
+
+# an out-of-range index is a zeroed entry, not a crash
+f += check.int_eq("index -1 is zeroed", cdf.leap_second_entry(0 - 1).year, 0)
+f += check.int_eq("index 42 is zeroed", cdf.leap_second_entry(42).year, 0)
+
+# TAI-UTC at known instants
+f += check.int_eq("2026 TAI-UTC is 37 s", cdf.tai_minus_utc_ns(2026, 8, 28), 37000000000)
+f += check.int_eq("on 2017-01-01 it is 37 s", cdf.tai_minus_utc_ns(2017, 1, 1), 37000000000)
+f += check.int_eq("the day before it is 36 s", cdf.tai_minus_utc_ns(2016, 12, 31), 36000000000)
+f += check.int_eq("1972-01-01 is 10 s", cdf.tai_minus_utc_ns(1972, 1, 1), 10000000000)
+f += check.int_eq("before the table it is 0", cdf.tai_minus_utc_ns(1959, 12, 31), 0)
+
+# from 1972 the exact and NASA-compatible forms agree exactly
+let dates = [[1972, 1, 1], [1990, 1, 1], [2012, 7, 1], [2017, 1, 1], [2026, 8, 28]]
+for d in dates {
+    f += check.int_eq("exact == nasa_compat",
+                      cdf.tai_minus_utc_ns(d[0], d[1], d[2]),
+                      cdf.tai_minus_utc_ns_nasa_compat(d[0], d[1], d[2]))
+}
+
+# before 1972 the offset drifts within a single entry — a constant here would mean the drift
+# term had been dropped
+f += check.is_true("1960 offset drifts",
+                   cdf.tai_minus_utc_ns(1960, 1, 1) != cdf.tai_minus_utc_ns(1960, 6, 1))
+
+# provenance and the currency guarantee
+f += check.is_true("the upstream stamp is recorded",
+                   cdf.leap_seconds_upstream_updated() == "20161025")
+f += check.is_true("2026 is inside the guarantee", cdf.leap_seconds_covers(2026, 8, 28))
+f += check.is_true("2099 is beyond it", cdf.leap_seconds_covers(2099, 1, 1) == false)
+
+let v = cdf.leap_seconds_verified_on()
+f += check.int_eq("verified in 2026", v.year, 2026)
+
+check.result(f)

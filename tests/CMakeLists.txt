@@ -44,6 +44,8 @@ endif()
 add_executable(cheatah_space_tests
     space_time_test.cpp
     space_civil_test.cpp
+    space_cdf_leapseconds_test.cpp
+    space_civil_test.cpp
 )
 target_link_libraries(cheatah_space_tests PRIVATE
     cheatah::space

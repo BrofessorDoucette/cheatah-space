@@ -34,7 +34,7 @@ push (scripts/test-biome-install.sh).
 | module | what it is | status |
 |---|---|---|
 | **`space.time`** | Julian Date, Modified Julian Date, J2000, and the NASA **CDF_EPOCH** bridge. Templated with concepts (scalar `Value` \| numeric `ndarray` \| future datetime-struct `ndarray`). The pun (spacetime) is intended. | **working** → [space/time](space/time/) |
-| **`space.cdf`** | NASA **Common Data Format** I/O, written from scratch in C++. | roadmap → [space/cdf](space/cdf/) |
+| **`space.cdf`** | NASA **Common Data Format** I/O, written from scratch in C++. NASA's leap-second table and the TAI-UTC lookup are in; the reader is next. | **in progress** → [space/cdf](space/cdf/) |
 | **`space.irbem`** | Radiation-belt & magnetic-field models — a clean-room reimplementation of **[PRBEM/IRBEM](https://github.com/PRBEM/IRBEM)**. | roadmap → [space/irbem](space/irbem/) |
 
 The through-line: each module has a canonical reference (NASA CDF C lib, IRBEM Fortran) we
@@ -109,8 +109,8 @@ committed by the gate:
 <!-- coverage:start -->
 | Metric | space package |
 |--------|---------------|
-| **Lines** | 100.00% (77/77) |
-| **Functions** | 100.00% (20/20) |
+| **Lines** | 100.00% (141/141) |
+| **Functions** | 100.00% (33/33) |
 | Regions | 100.00% |
 | Branches | 100.00% |
 <!-- coverage:end -->
