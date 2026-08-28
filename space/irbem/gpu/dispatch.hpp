@@ -221,7 +221,7 @@ inline constexpr std::size_t always_on_device = 1;
  * and cannot drift into a registry that allocates. Adding a kernel means adding a row here AND an
  * entry point there; the completeness test fails if only one of the two happens.
  */
-inline constexpr std::array<KernelInfo, 4> registered_kernels{{
+inline constexpr std::array<KernelInfo, 6> registered_kernels{{
     // MEASURED, RTX 3070 Ti / Vulkan, best of five per size, transfers included, against this
     // header's own host lane built -O2 -ffp-contract=off (n : device Mpts/s : host Mpts/s):
     //   2^10 : 14 : 444 | 2^14 : 145 : 440 | 2^16 : 240 : 440 | 2^18 : 280 : 446
@@ -285,6 +285,71 @@ inline constexpr std::array<KernelInfo, 4> registered_kernels{{
      "drift-shell ionospheric footpoints; one thread per shell azimuth, the final step halved onto "
      "r = 1 rather than interpolated across it",
      7, 0, 512},
+
+    // MEASURED, RTX 3070 Ti / Vulkan, best of seven per size, transfers included, against
+    // ext_t89.hpp's own fp32 host lane built -O3 -march=native -ffp-contract=off, over points
+    // scattered at 2..20 Re across the inner magnetosphere and near tail:
+    //
+    //     N points :  1024 :  2048 :  4096 : 16384 : 65536 :  2^20 :  2^22
+    //     speedup  : 0.74x : 1.40x : 2.60x : 7.17x : 12.1x : 12.9x : 15.1x
+    //
+    //   at N = 2^22 : device 3.25 ns/point | host 49.1 ns/point
+    //   max ABSOLUTE deviation device-vs-host over 2^20 points: 5.1e-05 nT. The largest RELATIVE
+    //   deviation, 3.0e-05, sits at a near-null where the external field is 0.23 nT; against a
+    //   typical 80 nT external field the same absolute error is 6e-07, inside the Blocal budget.
+    //
+    // Tsyganenko (1989) is closed-form straight-line arithmetic — no loop, no data-dependent
+    // branch, ~400 flops for 24 bytes in and 12 out, i.e. ~11 flops/byte. An order of magnitude
+    // above the dipole row's 0.5 and within a factor of two of IGRF's ~20, which is why it lands
+    // on IGRF's side of the ridge and not the dipole's. Crossover from the two throughputs and the
+    // measured ~62 us dispatch floor: the device pays once n/308e6 + 62e-6 < n/20.4e6, i.e.
+    // n > ~1300; rounded up to the next power of two.
+    //
+    // No coefficient BUFFER: the whole model is 30 scalars (sin psi, cos psi, C1..C19 and the nine
+    // non-linear parameters of one Kp bin), so they ride in the parameter block and the kernel fits
+    // dispatch_batch's pos/out/params/dims shape exactly.
+    {"irbem_t89_f32",
+     "Tsyganenko 1989 external B (nT) at each GSM point (Re); params = {sin psi, cos psi, C1..C19, "
+     "dx, a_rc, D0, gamma_rc, Rc, G, a_T, Dy, x0} for one Kp bin",
+     4, 30, 2048},
+
+    // MEASURED, RTX 3070 Ti / Vulkan, best of five, transfers included, against trace_api.hpp's
+    // fp64 host lane built -O3 -march=native -ffp-contract=off. Fixed step ds = 0.02 Re, 512
+    // samples of headroom per line, starts spread over L = 2..8:
+    //
+    //     N lines :       64 :      128 :      256 :      512 :     1024 :     4096 :    16384 :    65536
+    //     speedup : .33-.39x : .66-.69x : 1.0-1.2x : 2.0-2.2x : 3.7-3.9x : 9.9-13.3x : 9.6-23.5x : 19-26.3x
+    //     us/line :  450-473 :  234-236 :  143-151 :   76-77  :   42-43  :   11.9-15.3 : 6.8-11.0 :  6.0-7.0
+    //     host    :  154-165 us/line, flat in N
+    //
+    // FOUR full runs, and every cell is their spread rather than the best of them. Below 1 024
+    // lines the spread is a few per cent and the crossover reproduces at 256 on every run; at
+    // 16 384 the same size has measured 9.6x and 23.5x, a factor of 2.4 apart.
+    //
+    // The crossover is 256, where the device first wins. **It is LOWER than irbem_trace_i_f32's
+    // 512, and the reason is not that this kernel is cheaper -- it is that the HOST lane is dearer
+    // here**: a fixed ds = 0.02 Re line is ~250 steps against the invariant tracer's ~120 at
+    // ds = L/50, so the host costs 154 us/line against 60, and the same ~30-60 us submit floor is
+    // paid off in half the batch. A crossover is a ratio, not a property of the kernel alone, and
+    // this row is the cleanest evidence in the registry for why it is measured per kernel.
+    //
+    // WHERE THE BANDWIDTH SHOWS IS THE CEILING, NOT THE CROSSOVER. irbem_trace_i_f32 returns four
+    // floats per LINE (~9 400 flops/byte) and its speedup is still climbing at 65 536, reaching
+    // 48.9x. This one returns four floats per STEP -- ~125 flops/byte, some 75x less -- and its
+    // curve flattens in the low twenties and becomes run-to-run noisy above 4 096, where each
+    // batch stages 100 MB to 1 GB of results through host memory and the measurement stops being
+    // about the device at all. The two ranges above are the spread over two full runs and are
+    // quoted as ranges deliberately: reporting the best of them as a single number would be a
+    // performance claim the second run does not support. Two kernels rather than one on purpose:
+    // teaching the invariant tracer to emit `posit` would put this transfer in the L* hot path.
+    //
+    // Bindings: pos, coef, norm, path, bmag, report, dims. No scalar params: the fixed step and
+    // R0 ride in the dims buffer scaled by 1e6, the same trick the invariant tracer uses for
+    // steps_per_l.
+    {"irbem_trace_path_f32",
+     "field-line trace WITH its path; one thread per line, fixed step toward the Earth, writes "
+     "3M+M floats per line -- bandwidth-bound, unlike irbem_trace_i_f32",
+     7, 0, 256},
 }};
 
 /// The registry and the lease capacity must agree, checked at COMPILE time: a kernel that binds

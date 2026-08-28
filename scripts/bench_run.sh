@@ -11,10 +11,12 @@
 #   scripts/bench_run.sh build                 compile Google Benchmark (pinned) and the suite
 #   scripts/bench_run.sh run <suite>           run one suite, write docs/bench/<suite>.json
 #   scripts/bench_run.sh publish <suite>|all   run and regenerate that suite's table
-#   scripts/bench_run.sh baseline              run every suite and rewrite bench/baseline.csv
+#   scripts/bench_run.sh render <suite>|all    regenerate the table from the JSON already on disk
+#   scripts/bench_run.sh baseline              rewrite bench/baseline.csv from the published JSON
 #   scripts/bench_run.sh check                 run every suite and fail on a regression
 #   scripts/bench_run.sh manifest              print the routine manifest (no timing)
 #   scripts/bench_run.sh intensity             print the arithmetic-intensity model (no timing)
+#   scripts/bench_run.sh verify                check every device lane against its host lane
 #
 # Suites:
 #   irbem-per-routine   every routine, on every lane it has, against the IRBEM -O2 oracle
@@ -26,6 +28,7 @@
 #   CHEATAH_GPU_LINALG_DIR      cheatah-gpu-linalg checkout  (default ../cheatah-gpu-linalg)
 #   SPACE_IRBEM_ORACLE          the -O2 IRBEM build          (default /tmp/irbem-builds/libirbem-O2.so)
 #   CHEATAH_GPU_LINALG_VK_DEVICE  device name substring, e.g. NVIDIA / Intel / llvmpipe
+#   BENCH_SUITES                space-separated suite list  (default: all three)
 #   BENCH_REPS                  repetitions                  (default 5)
 #   BENCH_MIN_TIME              per-repetition minimum       (default 0.2s)
 set -euo pipefail
@@ -68,7 +71,9 @@ suite_filter() {
         *) die "unknown suite '$1' (irbem-per-routine, irbem-crossover, irbem-intensity)" ;;
     esac
 }
-ALL_SUITES=(irbem-per-routine irbem-crossover irbem-intensity)
+# `check` re-measures everything and that costs minutes; BENCH_SUITES narrows it to one suite for a
+# quick local gate, and is how the gate's own ability to FAIL is exercised without a 20-minute run.
+read -r -a ALL_SUITES <<< "${BENCH_SUITES:-irbem-per-routine irbem-crossover irbem-intensity}"
 
 # =============================================================================================
 # build
@@ -174,11 +179,15 @@ need_bin() { [[ -x "$BIN" ]] || cmd_build; }
 # run
 # =============================================================================================
 
+# Run one suite. The JSON lands in docs/bench/ by default — that copy is PUBLISHED provenance and
+# `check` must never overwrite it, or the committed baseline and the committed tables stop being the
+# same measurement. `check` therefore passes its own path.
 cmd_run() {
     local suite="$1"
+    local out="${2:-$JSON_DIR/$suite.json}"
     local filter; filter="$(suite_filter "$suite")"
     need_bin
-    mkdir -p "$JSON_DIR"
+    mkdir -p "$(dirname "$out")"
     note "running $suite (reps=$BENCH_REPS, min_time=$BENCH_MIN_TIME)"
     "$BIN" \
         --benchmark_filter="$filter" \
@@ -186,7 +195,7 @@ cmd_run() {
         --benchmark_min_time="$BENCH_MIN_TIME" \
         --benchmark_enable_random_interleaving=true \
         --benchmark_out_format=json \
-        --benchmark_out="$JSON_DIR/$suite.json" \
+        --benchmark_out="$out" \
         --benchmark_format=console
 }
 
@@ -216,34 +225,44 @@ json_rows() {
 # ns per point, from items_per_second — the one metric that is comparable across a scalar routine,
 # a 65536-point batch and a device dispatch, because every benchmark reports how many points it
 # processed via SetItemsProcessed.
+# Every cell carries its spread when the spread matters. A device lane contends with the driver,
+# the compositor and whatever else holds the queue, and a bare median hides that; a row reading
+# "11.27 ns ±67%" is telling you not to build an argument on it. Below 5% the suffix is omitted,
+# because at that point it is noise about noise.
 NS_AWK='function ns(ips) { return ips > 0 ? 1e9 / ips : 0 }
-        function fmt(x) { return x >= 1e6 ? sprintf("%.0f", x/1000) "\xc2\xb5s" \
-                                          : (x >= 1000 ? sprintf("%.2f", x/1000) " \xc2\xb5s" \
-                                                       : sprintf("%.2f", x) " ns") }'
+        function bare(x) { return x >= 1e6 ? sprintf("%.0f \xc2\xb5s", x/1000) \
+                                           : (x >= 1000 ? sprintf("%.2f \xc2\xb5s", x/1000) \
+                                                        : sprintf("%.2f ns", x)) }
+        function fmt(x, c) { return c > 0.05 ? sprintf("%s \xc2\xb1%.0f%%", bare(x), c * 100) \
+                                             : bare(x) }'
 
 table_per_routine() {
-    local json="$1" manifest="$2"
-    { json_rows "$json"; echo "@@"; cat "$manifest"; } | awk -F'\t' "$NS_AWK"'
+    local json="$1" manifest="$2" want="${3:-yes}"
+    { json_rows "$json"; echo "@@"; cat "$manifest"; } | awk -F'\t' -v want="$want" "$NS_AWK"'
     /^@@$/ { phase = 1; next }
     phase == 0 {
         if ($2 == "median") { med[$1] = ns($5) }
-        if ($2 == "stddev") { sd[$1] = $5 }
+        if ($2 == "cv")     { cv[$1] = $5 }
         next
     }
     /^#/ { next }
     {
         label = $1; cpu = $2; gpu = $3; irb = $4; status = $5; primary = $6
-        if (primary != "yes") next
+        if (primary != want) next
         c = (cpu in med) ? med[cpu] : 0
         g = (gpu in med) ? med[gpu] : 0
         i = (irb in med) ? med[irb] : 0
+        # The ratio is IRBEM against this module\x27s BEST lane, not against its CPU lane. A row
+        # whose whole point is that the work belongs on the device would otherwise be reported by
+        # the one lane it is not meant to run on.
+        best = (g > 0 && (c <= 0 || g < c)) ? g : c
         printf "| %s | %s | %s | %s | %s | %s | %s |\n",
             label,
-            (c > 0 ? fmt(c) : "—"),
-            (g > 0 ? fmt(g) : "—"),
+            (c > 0 ? fmt(c, cv[cpu]) : "—"),
+            (g > 0 ? fmt(g, cv[gpu]) : "—"),
             (c > 0 && g > 0 ? sprintf("%.2f\xc3\x97", c / g) : "—"),
-            (i > 0 ? fmt(i) : "—"),
-            (c > 0 && i > 0 ? sprintf("%.2f\xc3\x97", i / c) : "—"),
+            (i > 0 ? fmt(i, cv[irb]) : "—"),
+            (best > 0 && i > 0 ? sprintf("%.2f\xc3\x97", i / best) : "—"),
             status
     }'
 }
@@ -251,6 +270,12 @@ table_per_routine() {
 table_crossover() {
     local json="$1"
     json_rows "$1" | awk -F'\t' "$NS_AWK"'
+    {
+        name = $1
+        if (name !~ /trace_batch/) next
+        n0 = name; sub(/^.*trace_batch\//, "", n0); sub(/\/.*$/, "", n0)
+        if ($2 == "cv") { if (name ~ /^BM_cpu_/) hcv[n0 + 0] = $5; else gcv[n0 + 0] = $5 }
+    }
     $2 != "median" { next }
     {
         name = $1
@@ -275,7 +300,7 @@ table_crossover() {
                 verdict = (r >= 1.0) ? "device wins" : "**host wins**"
             }
             printf "| %d | %s | %s | %s | %s |\n", n,
-                (h > 0 ? fmt(h) : "—"), (d > 0 ? fmt(d) : "—"), ratio, verdict
+                (h > 0 ? fmt(h, hcv[n]) : "—"), (d > 0 ? fmt(d, gcv[n]) : "—"), ratio, verdict
         }
     }'
 }
@@ -284,7 +309,7 @@ table_intensity() {
     local json="$1" model="$2"
     { json_rows "$json"; echo "@@"; cat "$model"; } | awk -F'\t' "$NS_AWK"'
     /^@@$/ { phase = 1; next }
-    phase == 0 { if ($2 == "median") med[$1] = ns($5); next }
+    phase == 0 { if ($2 == "median") med[$1] = ns($5); if ($2 == "cv") cv[$1] = $5; next }
     /^#/ { next }
     {
         kernel = $1; label = $2; bytes = $3 + 0; flops = $4 + 0; fpb = $5 + 0
@@ -297,7 +322,7 @@ table_intensity() {
         }
         printf "| `%s` | %s | %d | %d | **%.1f** | %s | %s | %s | %s |\n",
             kernel, label, bytes, flops, fpb,
-            (h > 0 ? fmt(h) : "—"), (d > 0 ? fmt(d) : "—"), ratio, verdict
+            (h > 0 ? fmt(h, cv[$6]) : "—"), (d > 0 ? fmt(d, cv[$7]) : "—"), ratio, verdict
     }'
 }
 
@@ -316,8 +341,8 @@ stamp() {
      suite:        $suite
      generated:    $(date -u +%Y-%m-%d)
      commit:       $(git -C "$ROOT" rev-parse --short HEAD 2>/dev/null || echo unknown)
-     host:         $(uname -n), $(nproc) CPUs @ $(awk '/cpu MHz/ {printf "%.0f", $4; exit}' /proc/cpuinfo 2>/dev/null || echo "?") MHz
-     cpu-scaling:  $(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor 2>/dev/null || echo unknown)
+     host:         $(uname -n), $(nproc) CPUs, max $(awk '/cpu MHz/ {if ($4+0 > m) m = $4+0} END {printf "%.0f", m}' /proc/cpuinfo 2>/dev/null || echo "?") MHz observed
+     cpu-scaling:  $(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor 2>/dev/null || echo unknown) (the MHz above is a point-in-time sample of the FASTEST core, not the clock the benchmark ran at: under a scaling governor an idle machine reads near its floor, and the timed loops boost well above it)
      build:        $(g++ --version | head -1), Google Benchmark @ $BENCHMARK_PIN
      device:       $device
      competitors:  IRBEM $oracle_note (the -O2 REBUILD, never the shipped no-\`-O\` library)
@@ -349,7 +374,18 @@ cmd_publish() {
     local suite="$1"
     if [[ "$suite" == all ]]; then for s in "${ALL_SUITES[@]}"; do cmd_publish "$s"; done; return; fi
     cmd_run "$suite"
+    cmd_render "$suite"
+}
+
+# Regenerate a suite's table from the JSON already on disk. Same code path as `publish`, minus the
+# measurement — so a change to how a table is LAID OUT never costs a re-measurement, and a table
+# and the JSON beside it can be checked against each other after the fact.
+cmd_render() {
+    local suite="$1"
+    if [[ "$suite" == all ]]; then for s in "${ALL_SUITES[@]}"; do cmd_render "$s"; done; return; fi
     local json="$JSON_DIR/$suite.json"
+    [[ -f "$json" ]] || die "no $json — run 'scripts/bench_run.sh run $suite' first"
+    need_bin
     local body; body="$(mktemp)"
     local cmdline="SPACE_IRBEM_ORACLE='$SPACE_IRBEM_ORACLE' CHEATAH_GPU_LINALG_VK_DEVICE='${CHEATAH_GPU_LINALG_VK_DEVICE:-}' \\
            scripts/bench_run.sh publish $suite
@@ -361,10 +397,18 @@ cmd_publish() {
     case "$suite" in
     irbem-per-routine)
         local man; man="$(mktemp)"; "$BIN" --manifest > "$man"
+        local header='| routine | CPU per call | GPU per call | GPU speedup | IRBEM `-O2` per call | IRBEM / best lane | on GPU? |'
+        local rule='|---|--:|--:|--:|--:|--:|---|'
         { stamp "$suite" routines "$cmdline"; echo
-          echo '| routine | CPU ns/call | GPU ns/call | GPU speedup | IRBEM `-O2` ns/call | vs IRBEM | on GPU? |'
-          echo '|---|--:|--:|--:|--:|--:|---|'
-          table_per_routine "$json" "$man"
+          echo "$header"; echo "$rule"
+          table_per_routine "$json" "$man" yes
+          echo
+          echo '<details><summary><b>Also measured</b> — variants, and routines this module has not ported</summary>'
+          echo
+          echo "$header"; echo "$rule"
+          table_per_routine "$json" "$man" no
+          echo
+          echo '</details>'
         } > "$body"
         rm -f "$man" ;;
     irbem-crossover)
@@ -393,23 +437,35 @@ cmd_publish() {
 # baseline + check
 # =============================================================================================
 
-# suite,key,ns_per_point — one row per measured lane. Keys are benchmark run_names, which are
+# suite,benchmark,ns_per_point,cv — one row per measured lane. Keys are benchmark run_names, which are
 # stable by construction: `crossover_sizes` deliberately does NOT set ->MinTime, because Google
 # Benchmark writes that into the name and a name that moves when the harness is retuned would make
 # every baseline row unjoinable.
 emit_baseline() {
     local suite="$1"
-    json_rows "$JSON_DIR/$suite.json" | awk -F'\t' -v s="$suite" '
-        $2 == "median" && $5 > 0 { printf "%s,%s,%.6g\n", s, $1, 1e9 / $5 }'
+    local json="${2:-$JSON_DIR/$suite.json}"
+    json_rows "$json" | awk -F'\t' -v s="$suite" '
+        $2 == "median" && $5 > 0 { ns[$1] = 1e9 / $5 }
+        $2 == "cv"               { cv[$1] = $5 }
+        END { for (k in ns) printf "%s,%s,%.6g,%.4f\n", s, k, ns[k], cv[k] }'
 }
 
+# The baseline is written from the JSON ALREADY ON DISK, not from a fresh run. That is deliberate:
+# it makes the committed baseline and the committed tables the same measurement, taken in the same
+# minute on the same machine, rather than two runs that happen to be near each other. Run
+# `publish all` first; this then records what was published.
 cmd_baseline() {
     local s
-    { echo "# suite,benchmark,ns_per_point — regenerate with scripts/bench_run.sh baseline"
+    for s in "${ALL_SUITES[@]}"; do
+        [[ -f "$JSON_DIR/$s.json" ]] || die "no $JSON_DIR/$s.json — run 'publish all' first"
+    done
+    { echo "# suite,benchmark,ns_per_point,cv — written by scripts/bench_run.sh baseline from the"
+      echo "# same docs/bench/*.json that produced the tables in space/irbem/BENCHMARKS.md."
       echo "# host: $(uname -n), $(g++ --version | head -1), device ${CHEATAH_GPU_LINALG_VK_DEVICE:-default}"
+      echo "# governor: $(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor 2>/dev/null || echo unknown)"
       echo "# commit: $(git -C "$ROOT" rev-parse --short HEAD 2>/dev/null || echo unknown), $(date -u +%Y-%m-%d)"
-      for s in "${ALL_SUITES[@]}"; do cmd_run "$s" >/dev/null; emit_baseline "$s"; done
-    } | sort -u -t, -k1,2 > "$BASELINE"
+      for s in "${ALL_SUITES[@]}"; do emit_baseline "$s"; done | sort -t, -k1,1 -k2,2
+    } > "$BASELINE"
     note "wrote $BASELINE ($(grep -vc '^#' "$BASELINE") rows)"
 }
 
@@ -418,56 +474,83 @@ cmd_baseline() {
 # A row that regresses is re-measured once before it is called a regression, for the same reason.
 REGRESS_RATIO="${REGRESS_RATIO:-1.40}"
 REGRESS_FLOOR_NS="${REGRESS_FLOOR_NS:-2.0}"
+# Rows whose repetitions disagreed by more than this are measured and published but NOT gated. A
+# device lane that finishes in microseconds sits close to the dispatch floor and routinely spreads
+# 40%; the gate threshold would be inside that spread and the gate would be a coin flip. Found the
+# hard way — the first `check` run after this gate existed failed on `BM_gpu_dipole_field_batch` at
+# 4.26x, which was the driver's mood and not a regression.
+REGRESS_NOISY_CV="${REGRESS_NOISY_CV:-0.15}"
+
+# Rows of @p 1 that regressed against the baseline, as `key<TAB>baseline<TAB>now<TAB>ratio`.
+# One implementation, called twice — the first pass finds suspects, the second confirms them, and
+# a gate whose two passes could disagree about what a regression IS would be worse than no gate.
+regressions() {
+    awk -F, -v ratio="$REGRESS_RATIO" -v floor="$REGRESS_FLOOR_NS" -v noisy="$REGRESS_NOISY_CV" '
+        NR == FNR { if ($0 !~ /^#/) { base[$1 "," $2] = $3 + 0; bcv[$1 "," $2] = $4 + 0 } next }
+        {
+            k = $1 "," $2; v = $3 + 0
+            if (!(k in base)) next
+            if (bcv[k] > noisy || $4 + 0 > noisy) next   # too noisy to gate; see REGRESS_NOISY_CV
+            b = base[k]
+            if (v > b * ratio && v - b > floor)
+                printf "%s\t%.4g\t%.4g\t%.2f\n", k, b, v, v / b
+        }' "$BASELINE" "$1"
+}
+
+measure_all() {
+    local s out="$1" scratch
+    scratch="$(mktemp -d)"
+    : > "$out"
+    for s in "${ALL_SUITES[@]}"; do
+        cmd_run "$s" "$scratch/$s.json" >/dev/null
+        emit_baseline "$s" "$scratch/$s.json" >> "$out"
+    done
+    rm -rf "$scratch"
+}
 
 cmd_check() {
     [[ -f "$BASELINE" ]] || die "no baseline at $BASELINE — run 'scripts/bench_run.sh baseline'"
     # The flag lists in this script and in bench/CMakeLists.txt must agree, or the published table
     # and a CMake-built binary are measuring two different programs.
+    # Comments are stripped from BOTH directions first. The file explains its own flags in prose,
+    # so a naive grep finds `-march=native` in the comment that says why it is there even after it
+    # has been deleted from the flag list, and finds `-ffast-math` in the comment that bans it.
+    # Both mistakes were made here before this line read the way it does.
+    local code; code="$(grep -v '^[[:space:]]*#' "$ROOT/bench/CMakeLists.txt")"
     local f
     for f in "${BENCH_CXXFLAGS[@]:1}"; do
-        grep -q -- "$f" "$ROOT/bench/CMakeLists.txt" ||
+        grep -qF -- "$f" <<< "$code" ||
             die "bench/CMakeLists.txt does not carry '$f' — the two build paths have drifted"
     done
-    if grep -q -- '-ffast-math' "$ROOT/bench/CMakeLists.txt"; then
+    if grep -qF -- '-ffast-math' <<< "$code"; then
         die "-ffast-math appears in bench/CMakeLists.txt; it is banned (see the flag comment)"
     fi
 
-    local s now; now="$(mktemp)"
-    for s in "${ALL_SUITES[@]}"; do cmd_run "$s" >/dev/null; emit_baseline "$s" >> "$now"; done
+    # A device lane that computes the WRONG answer is not a fast lane, and a throughput gate cannot
+    # tell the difference: `launch_igrf` returning true says a dispatch was submitted, not that the
+    # kernel unpacked the coefficient buffer the way the host packed it. So every published speedup
+    # is gated on its own lane agreeing with the host lane first. On a machine with no device this
+    # says so and passes — "no GPU here" is not a regression.
+    need_bin
+    note "verifying the device lanes against their host lanes before grading any ratio"
+    "$BIN" --verify || die "a device lane is outside its docs/ERROR_BUDGET.md budget"
 
-    local failures; failures="$(mktemp)"
-    awk -F, -v ratio="$REGRESS_RATIO" -v floor="$REGRESS_FLOOR_NS" '
-        NR == FNR { if ($0 !~ /^#/) base[$1 "," $2] = $3 + 0; next }
-        {
-            k = $1 "," $2; v = $3 + 0
-            if (!(k in base)) next
-            b = base[k]
-            if (v > b * ratio && v - b > floor)
-                printf "%s\t%.4g\t%.4g\t%.2f\n", k, b, v, v / b
-        }' "$BASELINE" "$now" > "$failures"
+    local now failures; now="$(mktemp)"; failures="$(mktemp)"
+    measure_all "$now"
+    regressions "$now" > "$failures"
 
     if [[ -s "$failures" ]]; then
-        note "re-measuring $(wc -l < "$failures") suspected regressions before calling them one"
-        local recheck; recheck="$(mktemp)"
-        for s in "${ALL_SUITES[@]}"; do cmd_run "$s" >/dev/null; emit_baseline "$s" >> "$recheck"; done
-        awk -F, -v ratio="$REGRESS_RATIO" -v floor="$REGRESS_FLOOR_NS" '
-            NR == FNR { if ($0 !~ /^#/) base[$1 "," $2] = $3 + 0; next }
-            {
-                k = $1 "," $2; v = $3 + 0
-                if (!(k in base)) next
-                b = base[k]
-                if (v > b * ratio && v - b > floor)
-                    printf "%s\t%.4g\t%.4g\t%.2f\n", k, b, v, v / b
-            }' "$BASELINE" "$recheck" > "$failures"
-        rm -f "$recheck"
+        note "re-measuring $(wc -l < "$failures") suspected regression(s) before calling them one"
+        measure_all "$now"
+        regressions "$now" > "$failures"
     fi
 
     if [[ -s "$failures" ]]; then
-        printf 'bench_run: REGRESSION (>%sx and >%s ns slower than bench/baseline.csv)\n' \
+        printf 'bench_run: REGRESSION (>%sx AND >%s ns slower than bench/baseline.csv, confirmed by a re-run)\n' \
             "$REGRESS_RATIO" "$REGRESS_FLOOR_NS" >&2
-        printf '  %-64s %10s %10s %7s\n' "suite,benchmark" "baseline" "now" "ratio" >&2
+        printf '  %-58s %10s %10s %7s\n' "suite,benchmark" "baseline" "now" "ratio" >&2
         while IFS=$'\t' read -r k b v r; do
-            printf '  %-64s %10s %10s %6sx\n' "$k" "$b" "$v" "$r" >&2
+            printf '  %-58s %10s %10s %6sx\n' "$k" "$b" "$v" "$r" >&2
         done < "$failures"
         rm -f "$now" "$failures"; exit 1
     fi
@@ -480,10 +563,12 @@ cmd_check() {
 case "${1:-}" in
     build)     cmd_build ;;
     run)       cmd_run "${2:?usage: bench_run.sh run <suite>}" ;;
+    render)    cmd_render "${2:-all}" ;;
     publish)   cmd_publish "${2:-all}" ;;
     baseline)  cmd_baseline ;;
     check)     cmd_check ;;
     manifest)  need_bin; "$BIN" --manifest ;;
     intensity) need_bin; "$BIN" --intensity ;;
+    verify)    need_bin; "$BIN" --verify ;;
     *) sed -n '2,30p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 1 ;;
 esac

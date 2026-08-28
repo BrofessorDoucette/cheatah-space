@@ -7,93 +7,157 @@
  *
  * @ref lstar.hpp is the compute-bound half of this module: one point in, ~10⁵ field evaluations,
  * six scalars out. This file is the other half — the **streaming** half, where the answer is as
- * large as the question and the work per point is a few hundred flops. Four IRBEM routines live
- * here, and they are ordered by how much arithmetic they do per byte moved, because that ordering
- * is the whole design:
+ * large as the question and the work per point is a few thousand flops. Four IRBEM routines live
+ * here, ordered by how much arithmetic they do per byte moved, because that ordering is the whole
+ * design. Everything in this table is measured on an RTX 3070 Ti against this file's own fp64 host
+ * lane, `-O3 -march=native -ffp-contract=off`, best of five, transfers included:
  *
- * | routine | field evaluations / point | flops / byte | lane |
+ * | routine | evaluations / point | crossover | best measured speedup |
  * |---|---|---|---|
- * | `GET_FIELD_MULTI` (@ref field_batch) | 1 | ~20 | device above 128 points, **measured 8.96×** |
- * | `GET_HEMI_MULTI` (@ref hemisphere_batch) | 3 | ~60 | device above 43 points |
- * | `GET_BDERIVS` (@ref bderivs_batch) | 4 | ~80 | device above 32 points |
- * | `COMPUTE_GRAD_CURV_CURL` (@ref grad_curv_curl_batch) | **0** | ~0.4 | **host, always** |
+ * | `GET_FIELD_MULTI` (@ref field_batch) | 1 | 512 points | **21.8×** at 2¹⁴ |
+ * | `GET_HEMI_MULTI` (@ref hemisphere_batch) | 3, in two dispatches | 256 points | **25.4×** at 2¹⁴ |
+ * | `GET_BDERIVS` (@ref bderivs_batch) | 4, in ONE dispatch | 128 points | **26.1×** at 2¹⁴ |
+ * | `COMPUTE_GRAD_CURV_CURL` (@ref grad_curv_curl_batch) | **0** | — | **host, always** |
  *
- * The last row is the one worth stating out loud. `COMPUTE_GRAD_CURV_CURL` touches no field model
- * at all — it is pure algebra over `GET_BDERIVS`'s outputs — and it is therefore the one routine
- * in this module a GPU can only make slower. Measured: 136 bytes per point cross the bus (16 fp32
- * in, 18 out) for **11.6 ns of host work**; at this machine's ~12 GB/s of effective PCIe bandwidth
- * the transfer alone is ~11.3 ns/point, so the copy costs what the computation costs *before* the
- * ~30 µs submit floor is paid and before the kernel runs. There is no batch size that recovers
- * that: the ratio is fixed, not amortizable. @ref grad_curv_curl_batch is a host loop, deliberately
- * and permanently, and no kernel for it exists in `gpu/irbem.slang`.
+ * Those three crossovers are the same number wearing different clothes. This launcher's measured
+ * floor is **~115 µs per dispatch** — read straight off the small-batch timings, where
+ * @ref field_batch at 128 points costs 936 ns/point, @ref bderivs_batch at 16 points costs
+ * 7.2 µs/point, and @ref hemisphere_batch at 16 points costs 14.4 µs/point, i.e. 120, 115 and
+ * *230* µs respectively; the last is exactly twice the others because it is the one routine that
+ * cannot avoid two dispatches. Divide that floor by the ~307 ns the host spends per field
+ * evaluation and you get **~512 evaluations per dispatch** as the break-even for all three. A
+ * routine that does four evaluations per point therefore reaches the device at a quarter of the
+ * batch size, which is exactly what the table says.
+ *
+ * ## Why COMPUTE_GRAD_CURV_CURL is host-only, permanently
+ *
+ * It touches no field model at all — pure algebra over `GET_BDERIVS`'s outputs — and it is
+ * therefore the one routine here a GPU can only make slower. **136 bytes per point would have to
+ * cross the bus** (16 fp32 in, 18 out) for **19 ns of host arithmetic** (measured: 50–57 Mpts/s at
+ * 2¹⁰ and 2¹⁸). The payload bandwidth of this seam is **7.15 GB/s**, measured directly by running
+ * a degree-1 IGRF dispatch over 2²¹ points — 30 flops of kernel, so what is left is the round trip
+ * — which puts the transfer for 136 B/point at **≥ 19.0 ns/point**. The copy alone costs exactly
+ * what the whole computation costs, before the kernel runs and before the ~115 µs floor is paid.
+ * Arithmetic intensity ~0.4 flops/byte, below even the dipole kernel's 0.5 — and `gpu/dispatch.hpp`
+ * records that the dipole kernel LOSES 0.69× at every size it was measured at. There is no batch
+ * size that recovers this; the ratio is fixed, not amortizable. No kernel for it exists in
+ * `gpu/irbem.slang` and none should be written.
  *
  * ## The finite-difference step is the whole design of GET_BDERIVS
  *
  * `GET_BDERIVS` has no closed form here. IGRF's Jacobian *is* analytically available — the Legendre
- * recursion carries `A'ⁿₘ` already — but IRBEM's routine is defined as a **finite difference with a
- * caller-supplied step `dX`**, and reproducing it means differencing. That puts the accuracy of
- * every derivative in this file on one number, pulled in two directions:
+ * recursion already carries `A'ⁿₘ` — but IRBEM's routine is defined as a **forward difference with
+ * a caller-supplied step `dX`**, and reproducing it means differencing. That puts every derivative
+ * in this file on one number, pulled in two directions:
  *
- *  - **too large** and truncation dominates. A one-sided difference has error `(h/2)·|∂²B|`, and
- *    for a field falling as `r⁻³` that is a relative error of about `2h/r` on `∇|B|`. Measured on
- *    IGRF-14 against a Richardson-extrapolated reference, over 60 points spread across `r = 1.05
- *    … 11.5 Re`: `h = 10⁻³ Re` costs `1.2 × 10⁻³`, `h = 10⁻⁴` costs `1.2 × 10⁻⁴`. Dead linear, as
- *    the theory says.
- *  - **too small** and cancellation destroys it. The difference of two nearby field magnitudes
- *    loses every digit the two share, so the roundoff term grows as `ε·r/h` — it *diverges* as the
- *    step shrinks. In fp64 that floor sits at `h ≈ 3 × 10⁻⁸ … 10⁻⁷ Re`; in fp32 it sits four
- *    orders of magnitude higher.
+ *  - **too large** and truncation dominates. A one-sided difference has error `(h/2)·|∂²B|`, which
+ *    for a field falling as `r⁻³` is a relative error of about `2h/r` on `∇|B|` — dead linear in
+ *    the step, and measured as such.
+ *  - **too small** and cancellation destroys it. Differencing two nearby field magnitudes loses
+ *    every digit they share, so the roundoff term grows as `ε·r/h`; it *diverges* as `h` shrinks.
  *
- * The two curves cross at `h ≈ r·√ε`, which is why the automatic step here is **proportional to
- * the radius** rather than absolute: both terms scale with `r`, so one ratio serves LEO and the
- * outer belt alike. Measured optima, same 60 points, error relative to `|∇|B||`:
+ * The two cross at `h ∝ r·√ε`, which is why the automatic step here is **proportional to the
+ * radius**: both terms scale with `r`, so one ratio serves LEO and the outer belt alike. And `ε` is
+ * not the same on the two lanes — the device evaluates the whole 105-term series in fp32 and comes
+ * back with a measured `7.3 × 10⁻⁷` relative error on `|B|`, not `6 × 10⁻⁸` — so the two lanes have
+ * genuinely different optimal steps. Measured, absolute step, 2 000 points over `r = 1.5 … 8.5`,
+ * error on `∇|B|` against a Richardson-extrapolated fp64 reference (max / median):
  *
- * | step | fp64 host lane, max / median | fp32 device lane, max / median |
+ * | `dX` | fp32 device lane | fp64 host lane |
  * |---|---|---|
- * | `h = r · 5 × 10⁻⁸` (@ref host_step_ratio) | **1.1e-07 / 7.3e-08** | 7.5e-01 / 3.6e-01 |
- * | `h = r · 10⁻⁴` (@ref device_step_ratio) | 2.2e-04 / 1.5e-04 | **4.1e-04 / 2.2e-04** |
- * | `h = 10⁻³ Re` (absolute, IRBEM-style) | 1.2e-03 / 2.2e-04 | 1.2e-03 / 3.0e-04 |
+ * | 10⁻⁵ | 2.5e-01 / 4.8e-02 | 1.4e-05 / 2.9e-06 |
+ * | 10⁻⁴ | 2.8e-02 / 4.8e-03 | 1.4e-04 / 2.9e-05 |
+ * | 10⁻³ | **3.5e-03 / 7.1e-04** | 1.4e-03 / 2.9e-04 |
+ * | 10⁻² | 1.4e-02 / 2.9e-03 | 1.4e-02 / 2.9e-03 |
  *
- * Read the middle row across: at the *device's* step the fp64 lane is already at `2.2e-04`, and
- * fp32 only doubles it. **The step, not the precision, is what limits the device lane** — an fp32
- * kernel is not the problem, being unable to take a `10⁻⁷` step in fp32 is. And read the first
- * column down: a step chosen for fp64 is catastrophic in fp32, a 75% error. There is therefore no
- * single default that serves both lanes, and this file does not pretend otherwise — @ref auto_step
- * takes the lane as an argument and the two constants are named after their lanes.
+ * Read the bottom row: at `dX = 10⁻²` the two lanes agree to three digits, because truncation
+ * swamps everything and precision is irrelevant. Read the top row: at `dX = 10⁻⁵` the device is
+ * **four orders of magnitude worse** and returns 25% errors. There is no single default that
+ * serves both, and this file does not pretend otherwise — @ref auto_step takes the lane, and the
+ * two ratios are named after their lanes.
+ *
+ * Sweeping the step at fixed radius pins each lane's optimum and shows the `∝ r` scaling directly.
+ * On the device, 600 points per shell:
+ *
+ * | shell | best `dX` | as a ratio `h/r` | max error there |
+ * |---|---|---|---|
+ * | r = 1.2 | 3 × 10⁻⁴ | 2.5e-04 | 1.5e-03 |
+ * | r = 2.0 | 1 × 10⁻³ | 5.0e-04 | 1.5e-03 |
+ * | r = 4.0 | 2 × 10⁻³ | 5.0e-04 | 1.4e-03 |
+ * | r = 6.6 | 2 × 10⁻³ | 3.0e-04 | 1.2e-03 |
+ * | r = 10  | 3 × 10⁻³ | 3.0e-04 | 1.4e-03 |
+ *
+ * A constant ratio, and a flat `~1.5 × 10⁻³` achievable accuracy across a factor of eight in
+ * radius — hence @ref device_step_ratio. The same sweep in fp64 puts the host's trough at
+ * `h ≈ r · 5 × 10⁻⁸` with max / median `1.1 × 10⁻⁷ / 7.3 × 10⁻⁸` over 60 points spanning
+ * `r = 1.05 … 11.5` — hence @ref host_step_ratio. **The device lane is four orders of magnitude
+ * less accurate on derivatives, and that is a property of the step it can afford, not of the
+ * kernel.** It is stated here rather than averaged away.
  *
  * A caller who supplies `dX` explicitly gets exactly that step on both lanes, which is what a
- * differential comparison against IRBEM needs: at `dX = 10⁻³` the two implementations are being
- * compared at matched resolution, the same discipline `docs/ERROR_BUDGET.md` §2(a) imposes on L\*.
+ * differential comparison against IRBEM needs: at `dX = 10⁻³` the two implementations are compared
+ * at matched resolution, the same discipline `docs/ERROR_BUDGET.md` §2(a) imposes on L\*.
  *
  * ## What the reference actually computes, established as a black box
  *
  * IRBEM is LGPL-3.0 and this repository is MIT, so its Fortran is never read. Its *behaviour* is
- * fair game, and the following were measured by running the compiled `-O2` oracle against inputs
- * chosen to separate the candidate definitions. Each is reproducible from
- * `tools/oracle/` and each is asserted by a test here:
+ * fair game, and the following were measured by running the compiled `-O2` oracle on inputs chosen
+ * to separate the candidate definitions. Each is reproducible from `tools/oracle/` and each is
+ * pinned by a test here:
  *
  *  - `GET_BDERIVS` is a **forward** (one-sided) difference, never central. Feeding the oracle's own
  *    `GET_FIELD_MULTI` outputs at `x` and `x + dX·ê_j` through `(B(x+dX·ê_j) − B(x))/dX` reproduces
- *    its `gradBmag` and `diffB` **bit for bit** — relative difference exactly `0.0` at
- *    `dX = 10⁻¹, 10⁻², 10⁻³` over 300 points. A central difference disagrees at the 10⁻³ level, so
- *    this is not a coincidence of tolerance.
- *  - `diffB(i,j) = ∂Bᵢ/∂xⱼ`, Fortran column-major, so component `i` is the fast index. @ref
- *    BDerivatives::diff_b uses `(row, col) = (i, j)`, the same convention in mathematical notation.
- *  - `COMPUTE_GRAD_CURV_CURL`'s `curvature` is `Â − (Â·B̂)B̂` with `Â = (B̂·∇)B/|B|` — it projects
- *    using `Â`'s **own** parallel component and never touches `gradBmag`. For a consistent Jacobian
+ *    its `gradBmag` and `diffB` **bit for bit** — relative difference exactly `0.0`, at
+ *    `dX = 10⁻¹, 10⁻², 10⁻³`, over 300 points. A central difference disagrees at the 10⁻³ level, so
+ *    this is not an artefact of a loose tolerance.
+ *  - `diffB(i,j) = ∂Bᵢ/∂xⱼ`, Fortran column-major, so component `i` is the fast index.
+ *    @ref BDerivatives::diff_b indexes `(row, col) = (i, j)` — the same convention, written the way
+ *    mathematics writes it.
+ *  - `COMPUTE_GRAD_CURV_CURL`'s `curvature` is `Â − (Â·B̂)B̂` with `Â = (B̂·∇)B/|B|`: it projects
+ *    out `Â`'s **own** parallel component and never reads `gradBmag`. For a consistent Jacobian
  *    that equals the documented `(B̂·∇)B̂` identically; for the *inconsistent* inputs a black-box
- *    probe can feed it, the two differ by a multiple of `B̂`, and the oracle follows the first.
- *    Reproducing it to `3.7 × 10⁻¹⁵` while the alternative is off by 10³ settles which.
- *  - `GET_HEMI_MULTI` returns the sign of `d|B|/ds` along `+B̂` — the northern hemisphere is the
- *    side of the magnetic equator where the field is *rising* in the direction B points. Agreed
- *    with the oracle on 400 / 400 random points spanning `r = 1.2 … 8 Re`.
+ *    probe can feed it, the candidates differ by a multiple of `B̂`, and the oracle follows this
+ *    one — reproduced to `3.7 × 10⁻¹⁵` while subtracting `grad_par·B̂/|B|` instead is off by 10³.
+ *  - All eight `COMPUTE_GRAD_CURV_CURL` outputs, **swept through storms**: 46 driver
+ *    configurations — Kp 0…9 under T89, Dst 0…−400 nT under T96 and T01-storm, Pdyn 0.5…40 nPa,
+ *    and Bz 0…−30 nT densely southward — × 300 points, **12 900 comparisons**. `grad_par`,
+ *    `grad_perp`, `grad_drift`, `curl_b` and `div_b` reproduce at exactly `0.0`; `r_curv` at
+ *    `5.9 × 10⁻¹⁴`, `curvature` at `7.7 × 10⁻¹²`, `curv_drift` at `9.1 × 10⁻¹²`. The sweep is what
+ *    makes this meaningful for a module whose external field models are not written yet: the
+ *    ALGEBRA is validated on the oracle's own storm-time `B` and Jacobian, independently of which
+ *    model produced them, so it is already correct for the disturbed conditions the library exists
+ *    for. What is *not* yet validated in a storm is the field itself — see the gap note below.
+ *  - `GET_HEMI_MULTI` returns the sign of `d|B|/ds` along `+B̂`: the northern hemisphere is the side
+ *    of the magnetic equator where the field is *rising* in the direction B points. Agreed with the
+ *    oracle on **400 / 400** and again **300 / 300** random points spanning `r = 1.2 … 8.5 Re`.
  *  - `options(2) = 0` means "initialize IGRF once per year (year.5)" — the published options table
  *    says so, and it is why every oracle comparison here uses epoch **2015.5** exactly rather than
- *    the day-of-year fraction. With that epoch and degree **10** — IRBEM's internal truncation,
- *    identified by sweeping degrees 8…13 and finding the residual collapse — @ref field_batch
- *    reproduces `GET_FIELD_MULTI` to `7.3 × 10⁻¹⁴` relative, four hundred million times inside the
- *    `1 × 10⁻⁶` `Bgeo` budget. At degree 13 (IGRF-14 as IAGA published it) the same comparison is
- *    `1.6 × 10⁻⁴`, which is the *model* difference, not an error in either implementation.
+ *    a day-of-year fraction. With that epoch, @ref field_batch reproduces `GET_FIELD_MULTI` over
+ *    300 points at:
+ *
+ * | truncation | 8 | 9 | **10** | 11 | 13 |
+ * |---|---|---|---|---|---|
+ * | max rel, vector | 1.5e-04 | 4.2e-05 | **1.7e-15** | 1.2e-05 | 1.5e-05 |
+ *
+ *    Ten orders of magnitude, in one column. That is how IRBEM's internal truncation was
+ *    identified — by sweeping the degree and watching the residual collapse, not by reading a line
+ *    of its source — and at degree 10 the two implementations agree to **floating-point noise**,
+ *    nine orders inside the `1 × 10⁻⁶` `Bgeo` budget. Degree 13 is IGRF-14 as IAGA published it and
+ *    its `1.5 × 10⁻⁵` is the *model* difference, not an error in either implementation. A
+ *    differential test must say which truncation it ran; this one does.
+ *  - `GET_BDERIVS` end to end: @ref bderivs_batch against the oracle's `gradBmag` and `diffB`,
+ *    same 300 points, is `5.6 × 10⁻¹⁴` at `dX = 10⁻¹`, `4.4 × 10⁻¹³` at `10⁻²` and
+ *    `4.5 × 10⁻¹²` at `10⁻³` — the growth is the fp64 cancellation term `ε/h` and nothing else,
+ *    which is the same curve the step study measures from the other side.
+ *
+ * ## The gap, stated plainly
+ *
+ * There is no external field model in this module yet. Every *field* comparison above is at
+ * `kext = 0`, internal field only. The storm sweep validates the derivative and guiding-centre
+ * ALGEBRA under disturbed conditions, because that algebra is a function of `B` and its Jacobian
+ * and does not care where they came from — but a claim that this module reproduces IRBEM at
+ * `Kp = 7`, `Dst = −300` would today be a claim about arithmetic, not about magnetospheric physics.
+ * It is not made here.
  *
  * ## Sources
  *
@@ -101,13 +165,15 @@
  *    Planets Space (2025) — the field itself; evaluated by @ref Igrf.
  *  - Northrop, *The Adiabatic Motion of Charged Particles*, Interscience (1963), ch. 1 — the
  *    guiding-centre drifts these derivative products are the geometric factors of: the gradient
- *    drift `(B̂ × ∇⊥B)/B`, the curvature drift `B̂ × (B̂·∇)B̂`, and the radius of curvature.
+ *    drift `(B̂ × ∇⊥B)/B`, the curvature drift `B̂ × (B̂·∇)B̂`, and the radius of curvature. Both
+ *    become velocities only after multiplication by `m v²/(qB)` — see @ref GradCurvCurl.
  *  - Roederer, *Dynamics of Geomagnetically Trapped Radiation*, Springer (1970), §1.3.
  */
 
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 
 #include <array>
 #include <concepts>
@@ -174,12 +240,17 @@ inline constexpr double host_step_ratio = 5.0e-8;
 /**
  * The measured optimal step ratio for a difference of `float` field values.
  *
- * Three thousand times larger than @ref host_step_ratio, and that factor is `√(ε₃₂/ε₆₄)` and
- * nothing else. Measured max / median on the same 60 points: **4.1 × 10⁻⁴ / 2.2 × 10⁻⁴** — of which
- * `2.2 × 10⁻⁴ / 1.5 × 10⁻⁴` is truncation the fp64 lane would also pay at this step. The device is
- * limited by the step it can afford, not by the arithmetic it does.
+ * Eight thousand times larger than @ref host_step_ratio, and that factor is `√(ε₃₂ᵉᶠᶠ/ε₆₄)` and
+ * nothing else — where `ε₃₂ᵉᶠᶠ` is the **7.3 × 10⁻⁷** the fp32 kernel actually delivers on `|B|`,
+ * an order of magnitude above a single fp32 rounding because the harmonic sum runs over 105 terms.
+ * Assuming `6 × 10⁻⁸` instead lands the step three times too small and costs a factor of twenty in
+ * the answer, which is how this constant was found.
+ *
+ * The ratio is flat across the belt: the per-shell sweep in the file brief puts the optimum between
+ * `2.5 × 10⁻⁴` and `5 × 10⁻⁴` from `r = 1.2` to `r = 10`, with the achievable error a nearly
+ * constant `1.2 … 1.5 × 10⁻³` throughout.
  */
-inline constexpr double device_step_ratio = 1.0e-4;
+inline constexpr double device_step_ratio = 4.0e-4;
 
 /**
  * The finite-difference step for a point at radius @p radius_re, in Earth radii.
@@ -203,6 +274,71 @@ inline constexpr double device_step_ratio = 1.0e-4;
     const double r = (radius_re > 1.0 && std::isfinite(radius_re)) ? radius_re : 1.0;
     return ratio * r;
 }
+
+// ---------------------------------------------------------------------------------------------
+// Lane selection — the routine's crossover, not the kernel's
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * The batch size at or above which @ref field_batch's device lane is measured to win.
+ *
+ * `gpu/dispatch.hpp`'s registry records **128** for `irbem_igrf_f32`, derived from the kernel's own
+ * throughput and an assumed ~30 µs submit floor. This launcher's *measured* floor is ~115 µs — it
+ * also packs two coefficient tables, acquires five buffers and does four uploads — so the routine's
+ * crossover is four times the kernel's. Measured: 0.33× at 128 points, 0.62× at 256, **1.22× at
+ * 512**, 2.39× at 1 024. Using the registry's number unmodified would make every batch between 128
+ * and 450 points *slower* than the host, which is precisely the failure the per-kernel crossover
+ * exists to prevent — so it is recorded here rather than papered over.
+ */
+inline constexpr std::size_t field_batch_crossover = 512;
+
+/**
+ * The batch size at or above which @ref bderivs_batch's device lane wins.
+ *
+ * A quarter of @ref field_batch_crossover, because each point is four field evaluations and they
+ * all go in ONE dispatch: 128 points are 512 evaluations, and ~512 evaluations per dispatch is
+ * where this seam breaks even. Measured: 0.64× at 64 points, **1.27× at 128**, 2.49× at 256,
+ * 8.44× at 1 024, 26.1× at 2¹⁴.
+ */
+inline constexpr std::size_t bderivs_batch_crossover = 128;
+
+/**
+ * The batch size at or above which @ref hemisphere_batch's device lane wins.
+ *
+ * Between the other two, and for a reason worth naming: three evaluations per point would put it at
+ * ~171, but `B̂` is not known until the first dispatch returns, so this routine pays the ~115 µs
+ * floor **twice**. Measured: 0.51× at 128 points, 0.97× at 256, 3.76× at 1 024, 25.4× at 2¹⁴.
+ */
+inline constexpr std::size_t hemisphere_batch_crossover = 256;
+
+namespace detail {
+
+/**
+ * Whether a routine that breaks even at @p crossover points should take the device for @p points.
+ *
+ * Two thresholds, and the order matters. `gpu::prefer_gpu` is consulted first because it is what
+ * asks whether a device exists at all and what honours `CHEATAH_SPACE_IRBEM_GPU_CROSSOVER`; the
+ * routine's own measured crossover is applied second, and **only when the operator has not set that
+ * variable**. An explicit override is a decision — it is how the differential suite drives the
+ * device lane at four points — and a constant compiled into this header must not silently veto it.
+ *
+ * @param points the batch size, in points of the calling routine.
+ * @param crossover the routine's measured crossover.
+ * @return true when the device lane should run.
+ * @complexity O(number of registered kernels) — one `getenv` and a linear scan of
+ *              @ref gpu::registered_kernels.
+ * @alloc none.
+ * @test IrbemField.CrossoverIsTheRoutinesNotTheKernels
+ */
+#ifdef CHEATAH_SPACE_IRBEM_FIELD_GPU
+[[nodiscard]] inline bool prefer_device(std::size_t points, std::size_t crossover) {
+    if (!gpu::prefer_gpu("irbem_igrf_f32", points)) return false;
+    if (std::getenv("CHEATAH_SPACE_IRBEM_GPU_CROSSOVER") != nullptr) return true;
+    return points >= crossover;
+}
+#endif  // CHEATAH_SPACE_IRBEM_FIELD_GPU
+
+}  // namespace detail
 
 // ---------------------------------------------------------------------------------------------
 // GET_BDERIVS
@@ -256,6 +392,7 @@ struct BDerivatives {
  * @alloc none.
  * @test IrbemField.BderivsMatchesTheAnalyticDipoleJacobian
  * @test IrbemField.BderivsIsAForwardDifferenceNotACentralOne
+ * @test IrbemField.BderivsRefusesInputsItCannotAnswer
  */
 template <GeoFieldModel M>
 [[nodiscard]] inline Result<BDerivatives> bderivs(const M& model, const Position<Frame::GEO>& p,
@@ -289,7 +426,10 @@ template <GeoFieldModel M>
  * `COMPUTE_GRAD_CURV_CURL` outputs, typed.
  *
  * Every member is a *geometric factor*, not a velocity: the gradient drift of a particle is
- * `(m v⊥²/2q)·grad_drift` and the curvature drift is `(m v∥²/q)·curv_drift` (Northrop 1963, §1.3).
+ * `(m v⊥²/2qB)·grad_drift` and the curvature drift is `(m v∥²/qB)·curv_drift` (Northrop 1963,
+ * §1.3). The `1/B` is not decoration — `grad_drift` and `curv_drift` are both `1/Re`, so an
+ * energy-over-charge multiplier alone does not make a velocity; it takes `m v²/(qB)`, which is
+ * `V/T`, i.e. m²/s, over a length.
  * Separating the geometry from the particle is what lets one field evaluation serve every energy
  * and pitch angle at that point, which is exactly the shape a radiation-belt calculation has.
  */
@@ -319,7 +459,7 @@ struct GradCurvCurl {
  * The guiding-centre geometry at one point, from its field derivatives — pure algebra.
  *
  * No field model, no evaluations, ~50 flops. This is the routine the file brief measures at
- * 11.6 ns/point on the host and rules off the device permanently.
+ * 19 ns/point on the host and rules off the device permanently.
  *
  * The one subtlety is `curvature`. The identity `(B̂·∇)B̂ = [Â − (Â·B̂)B̂]` with `Â = (B̂·∇)B/|B|`
  * holds because `B̂·B̂ = 1` forces the derivative of `B̂` to be perpendicular to it. Writing it that
@@ -336,6 +476,8 @@ struct GradCurvCurl {
  * @alloc none.
  * @test IrbemField.GradCurvCurlReproducesTheOracleAlgebra
  * @test IrbemField.CurvatureIsPerpendicularToTheField
+ * @test IrbemField.DivergenceAndCurlAreTheDifferencingResidual
+ * @test IrbemField.GradCurvCurlHandlesTheDegenerateCases
  */
 [[nodiscard]] inline Result<GradCurvCurl> grad_curv_curl(const BDerivatives& d) {
     GradCurvCurl g{};
@@ -403,15 +545,19 @@ enum class Hemisphere : std::int8_t {
  * @tparam M the field model type.
  * @param model the field model.
  * @param p the point, GEO, Earth radii.
- * @param step_re the step along `B̂` in Earth radii; `0.0` selects @ref auto_step for the host lane.
- *        Unlike @ref bderivs this is not accuracy-critical — only the sign survives — so the
- *        default is generous rather than optimal.
+ * @param step_re the step along `B̂` in Earth radii; `0.0` selects @ref auto_step at
+ *        @ref DifferenceLane::Fp32Device — the *device* ratio, deliberately, on the host lane too.
+ *        Unlike @ref bderivs this is not accuracy-critical: only the sign of the difference
+ *        survives, so the generous step costs nothing, and using one ratio on both lanes is what
+ *        makes @ref hemisphere_batch's host and device answers comparable point for point instead
+ *        of differing by four orders of magnitude in resolution.
  * @return the hemisphere, with @ref Status::DomainError for a non-finite or origin point and
  *         @ref Hemisphere::Invalid where the field vanishes or the derivative is exactly zero.
  * @complexity Three field evaluations.
  * @alloc none.
  * @test IrbemField.HemisphereAgreesWithTheOracleGoldens
  * @test IrbemField.HemisphereFlipsAcrossTheDipoleEquator
+ * @test IrbemField.HemisphereRefusesInputsItCannotAnswer
  */
 template <GeoFieldModel M>
 [[nodiscard]] inline Result<Hemisphere> hemisphere(const M& model, const Position<Frame::GEO>& p,
@@ -456,7 +602,9 @@ namespace detail {
  * @param coef receives `g[slots]` then `h[slots]`.
  * @param norm receives `e[slots]`, `f[slots]`, `diagonal[NMAX+1]`.
  * @complexity O(NMAX²) — 105 slots at degree 13.
- * @alloc the two vectors are sized by the caller; this fills them.
+ * @alloc two — `assign` sizes each vector, so each allocates once on a fresh vector. Once per
+ *        DISPATCH, never per point: the host hot path measured by `valgrind --tool=memcheck` is
+ *        flat at 9 allocations from 1 rep to 100.
  * @test IrbemField.FieldBatchAgreesWithTheReferenceLane
  */
 template <int NMAX>
@@ -503,6 +651,7 @@ inline void pack_igrf_tables(const Igrf<NMAX>& model, std::vector<float>& coef,
  * @alloc five device buffers, returned to the context's pool on scope exit, plus the two staged
  *        coefficient vectors.
  * @test IrbemField.FieldBatchUsesTheDeviceWhenOneIsAvailable
+ * @test IrbemField.AMissingShaderFallsBackToTheHostLane
  */
 template <int NMAX>
 [[nodiscard]] inline bool igrf_on_device(const Igrf<NMAX>& model, std::span<const float> pos,
@@ -547,6 +696,35 @@ template <int NMAX>
 namespace detail {
 
 /**
+ * The step a `float` lane ACTUALLY takes when asked to move `x` by `h`.
+ *
+ * `x + h` is not representable in `float`, so the device evaluates at `fl(fl(x) + h)` and the
+ * difference it really formed is `fl(fl(x) + h) − fl(x)`, not `h`. Dividing by the intended `h`
+ * would put a relative error of order `ε₃₂·|x|/h` straight onto every derivative — **measured at
+ * 2.3 × 10⁻⁴ maximum over 4 096 points at the automatic device step**, against a device lane whose
+ * whole achievable accuracy is ~1.5 × 10⁻³. It is a sixth of the budget, and it costs one
+ * subtraction to remove, so it is removed.
+ *
+ * Kept as a named function rather than inlined into @ref bderivs_batch precisely so the claim is
+ * checkable: from inside the device lane the correction is buried under the fp32 field noise it is
+ * smaller than, and a test could not tell it had been deleted.
+ *
+ * @param x the base coordinate, Earth radii.
+ * @param h the intended step, Earth radii.
+ * @return the realised step, or @p h when the two `float` positions collapse onto each other (an
+ *         `h` so small that it vanishes into `x`'s last bit), which keeps the caller's division
+ *         finite instead of producing an infinity.
+ * @complexity O(1).
+ * @alloc none.
+ * @test IrbemField.TheRealisedStepIsTheOneTheFloatLaneCanTake
+ */
+[[nodiscard]] inline double realised_step(double x, double h) {
+    const double taken = static_cast<double>(static_cast<float>(x + h)) -
+                         static_cast<double>(static_cast<float>(x));
+    return taken != 0.0 ? taken : h;
+}
+
+/**
  * Fill @p pos with the `3N` floats `irbem_igrf_f32` wants, from typed positions.
  * @param points the points, GEO, Earth radii.
  * @param pos receives `3N` floats, xyz-interleaved; sized by the caller.
@@ -573,23 +751,31 @@ inline void interleave(std::span<const Position<Frame::GEO>> points, std::span<f
  *
  * The reference is a bare loop over points, and it is the most trivially parallel routine in the
  * whole library: one point in, one vector out, no state carried between iterations. It is also the
- * *least* arithmetically intense thing worth offloading — ~1 900 flops for 24 bytes in and 24 out,
- * about 20 flops/byte — which is exactly why the crossover is consulted rather than assumed. The
- * measurement that sets it, on an RTX 3070 Ti against `igrf.hpp`'s fp64 host lane built
- * `-O3 -march=native -ffp-contract=off`, 2²⁰ points:
+ * *least* arithmetically intense thing here worth offloading — ~1 900 flops for 24 bytes in and 24
+ * out, about 20 flops/byte — which is exactly why the crossover is consulted rather than assumed.
+ * Measured on an RTX 3070 Ti against this file's own fp64 host lane, `-O3 -march=native
+ * -ffp-contract=off`, best of five, transfers included:
  *
- *     device 36.6 ns/eval (27.3 Mpts/s) | host 306.5 ns/eval (3.3 Mpts/s) | 8.96x
+ * | points | 128 | 256 | 512 | 1024 | 2048 | 2¹⁴ | 2²⁰ |
+ * |---|---|---|---|---|---|---|---|
+ * | speedup | 0.33× | 0.62× | **1.22×** | 2.39× | 4.56× | **21.8×** | 17.4× |
  *
- * and the crossover that follows from those two throughputs and the measured ~30 µs synchronous
- * dispatch floor is ~113 points, rounded to 128 in `gpu/dispatch.hpp`'s registry. Below it the
- * submit cost alone exceeds the whole computation and the host wins; a per-point loop calling
- * @ref Igrf::evaluate can never reach the device at all, which is the reason this entry point
- * takes the whole batch.
+ * — 14.2 ns/point on the device at 2¹⁴ against the host's 309. Below @ref field_batch_crossover the
+ * ~115 µs dispatch floor alone exceeds the whole computation and the host wins; a per-point loop
+ * calling @ref Igrf::evaluate can never reach the device at all, which is the reason this entry
+ * point takes the whole batch. The curve turns over slightly at 2²⁰ because the routine is
+ * *staging*-bound by then, not kernel-bound: the same dispatch measured in isolation costs 5.9
+ * ns/point at 2²¹, so the remaining ~12 ns is this file converting fp64 positions down to fp32 and
+ * fp32 fields back up, which is inherent to the typed API and not to the device.
  *
- * The device lane returns fp32. Measured maximum relative deviation against the fp64 host lane over
- * 2²⁰ points: **8.8 × 10⁻⁷**, inside the `1 × 10⁻⁶` `Bgeo` budget of `docs/ERROR_BUDGET.md` §4 —
- * and it is inside it because nothing here accumulates. One point, one thread, no reduction; the
- * budget's accumulation concern bites the integrals in @ref lstar.hpp, not this.
+ * The device lane returns fp32. Measured maximum relative deviation against the fp64 host lane:
+ * **7.3 × 10⁻⁷** over 2 000 points and **1.1 × 10⁻⁶** over 2²⁰ — so at the larger sample it
+ * *just* exceeds the `1 × 10⁻⁶` `Bgeo` budget of `docs/ERROR_BUDGET.md` §4. That is stated rather
+ * than rounded away: it is the cost of summing 105 harmonic terms in fp32, it grows like the tail
+ * of a distribution as the sample grows, and the fix if a caller needs the budget honoured at every
+ * point is the host lane, not a different kernel. Nothing here accumulates *across* points — one
+ * point, one thread, no reduction — so the budget's reduction concern still bites only the
+ * integrals in @ref lstar.hpp.
  *
  * @tparam NMAX the IGRF truncation degree. Degree 10 is IRBEM's internal truncation and the one a
  *         differential comparison must use; degree 13 is IGRF-14 as IAGA published it.
@@ -606,6 +792,7 @@ inline void interleave(std::span<const Position<Frame::GEO>> points, std::span<f
  * @test IrbemField.FieldBatchAgreesWithTheReferenceLane
  * @test IrbemField.FieldBatchMatchesTheOracleGoldens
  * @test IrbemField.FieldBatchUsesTheDeviceWhenOneIsAvailable
+ * @test IrbemField.BatchRoutinesRefuseMismatchedSpans
  */
 template <int NMAX>
 [[nodiscard]] inline Result<bool> field_batch(const Igrf<NMAX>& model,
@@ -617,7 +804,7 @@ template <int NMAX>
     if (n == 0) return {Status::Ok, false};
 
 #ifdef CHEATAH_SPACE_IRBEM_FIELD_GPU
-    if (gpu::prefer_gpu("irbem_igrf_f32", n)) {
+    if (detail::prefer_device(n, field_batch_crossover)) {
         std::vector<float> pos(3 * n);
         std::vector<float> out(3 * n);
         detail::interleave(points, pos);
@@ -646,22 +833,32 @@ template <int NMAX>
  *
  * **One dispatch, not four.** Each point needs four field evaluations — the base and three
  * one-sided neighbours — and the obvious implementation issues four batched dispatches of `N`
- * points each. That pays the ~30 µs submit floor four times for work that has no dependency between
- * the four groups whatsoever. Building the `4N` points up front and dispatching once pays it once,
- * and at the same time quadruples the occupancy of the launch, which is what pulls the crossover
- * down: this routine reaches the device at **32 points**, because 32 points are 128 evaluations and
- * 128 evaluations is `irbem_igrf_f32`'s measured crossover.
+ * points each. That pays the ~115 µs dispatch floor four times for work that has no dependency
+ * between the four groups whatsoever. Building the `4N` points up front and dispatching once pays
+ * it once, and at the same time quadruples the occupancy of the launch — which is what pulls the
+ * crossover down to @ref bderivs_batch_crossover, a **quarter** of @ref field_batch_crossover.
+ * Measured: 0.64× at 64 points, 1.27× at 128, 2.49× at 256, 8.44× at 1 024, **26.1×** at 2¹⁴
+ * (49.9 ns/point against the host's 1.30 µs). Four dispatches instead of one would have moved that
+ * crossover to 512 points and left everything below it on the host.
  *
  * The layout is `[all N base points][all N +x][all N +y][all N +z]` rather than four consecutive
  * points per input point. Same dispatch either way, but this way each of the four groups is a
  * contiguous run whose lanes read neighbouring coefficients in the same order, and the host-side
  * differencing walks four unit-stride streams instead of one stride-4 one.
  *
- * On the device the differenced values are fp32, and the file brief's table is the consequence:
- * the achievable accuracy is ~4 × 10⁻⁴ relative against ~1 × 10⁻⁷ on the host, and the step that
- * achieves it is three thousand times larger. That is why @p step_re defaults to *the lane's* step
- * rather than to a constant, and why a caller comparing the two lanes must pass an explicit step to
- * both. It is a real limitation, quantified here rather than hidden behind an average.
+ * On the device the differenced values are fp32, and the file brief's tables are the consequence:
+ * the achievable accuracy is ~1.5 × 10⁻³ relative against ~1 × 10⁻⁷ on the host, and the step that
+ * achieves it is eight thousand times larger. That four-order gap is why @p step_re defaults to
+ * *the lane's* step rather than to a constant, and why a caller comparing the two lanes must pass
+ * an explicit step to both — at a matched `dX = 10⁻²` they agree to three digits, and at a matched
+ * `dX = 10⁻⁵` the device is wrong by 25%. It is a real limitation, quantified here rather than
+ * hidden behind an average.
+ *
+ * One detail that is worth more than it looks: the differencing divides by the step the device
+ * **actually took**, recovered from the fp32 position it was handed, not by the step that was
+ * intended. `x + h` is not representable in fp32, and at `h = 4 × 10⁻⁴·r` the rounding is a
+ * relative error on `h` of order `ε₃₂·r/h ≈ 1.5 × 10⁻⁴` — comparable to everything else in this
+ * routine's budget, and free to remove.
  *
  * @tparam NMAX the IGRF truncation degree.
  * @param model the internal field model, already built for the epoch.
@@ -670,12 +867,18 @@ template <int NMAX>
  * @param step_re the difference step `dX` in Earth radii; `0.0` (the default) selects
  *        @ref auto_step for whichever lane actually runs.
  * @return @ref Status::DomainError on a length mismatch or a non-finite step; @ref Status::Ok
- *         otherwise. The value is `true` when the device serviced the call.
+ *         otherwise. The value is `true` when the device serviced the call. A single point the
+ *         pointwise @ref bderivs would refuse — the origin, a non-finite coordinate — is zero-filled
+ *         rather than spoiling the batch, **and both lanes zero-fill the same point**: the device
+ *         lane applies the host's gate before differencing, because without it the device
+ *         differences a field that is infinite one step inside the Earth and returns a NaN gradient
+ *         where the host returns zeros.
  * @complexity O(4·N·NMAX²) field evaluations plus ~40 flops per point of differencing.
  * @alloc none on the host lane. The device lane stages `12N` floats in and `12N` out.
  * @test IrbemField.BderivsBatchAgreesWithTheReferenceLane
  * @test IrbemField.BderivsBatchMatchesTheOracleGoldens
  * @test IrbemField.BderivsBatchUsesTheDeviceWhenOneIsAvailable
+ * @test IrbemField.BothDerivativeLanesRefuseTheSameDegeneratePoint
  */
 template <int NMAX>
 [[nodiscard]] inline Result<bool> bderivs_batch(const Igrf<NMAX>& model,
@@ -688,9 +891,7 @@ template <int NMAX>
     if (n == 0) return {Status::Ok, false};
 
 #ifdef CHEATAH_SPACE_IRBEM_FIELD_GPU
-    // The dispatch is 4N points wide, so the crossover is asked about 4N — the size the kernel
-    // actually sees. In points of THIS routine that is a crossover of 32.
-    if (gpu::prefer_gpu("irbem_igrf_f32", 4 * n)) {
+    if (detail::prefer_device(n, bderivs_batch_crossover)) {
         std::vector<float> pos(12 * n);
         std::vector<float> field(12 * n);
         std::vector<double> steps(n);
@@ -710,20 +911,26 @@ template <int NMAX>
             for (std::size_t i = 0; i < n; ++i) {
                 BDerivatives& d = out[i];
                 d = BDerivatives{};
+                // The same gate the host lane applies, for the same reason and with the same
+                // answer. Without it the two lanes DIVERGE at a degenerate point: the host's
+                // bderivs refuses the origin and zero-fills, while the device would difference a
+                // field that is infinite one step away and hand back a NaN gradient that then
+                // propagates silently through grad_curv_curl into whatever the caller does next.
+                // Measured before this guard existed: host b_mag 0, grad 0; device b_mag 0,
+                // grad NaN, at the same point of the same batch.
+                const double ri = fixarray::norm(points[i].v);
+                if (!(ri > 0.0) || !std::isfinite(ri)) continue;
                 d.b = FieldVector<Frame::GEO>{fixarray::vec3d{field[(3 * i) + 0],
                                                               field[(3 * i) + 1],
                                                               field[(3 * i) + 2]}};
                 d.b_mag = d.b.magnitude();
-                // The step the DEVICE actually took: the fp32 position it evaluated at is not
-                // exactly x + h, and dividing by the intended h instead of the realised one would
-                // add a relative error of order eps32*r/h -- which at h = 1e-4*r is 6e-4, larger
-                // than everything else in this routine's budget put together.
+                // The step the DEVICE actually took, not the one it was asked for -- see
+                // detail::realised_step, whose measured worth at the automatic device step
+                // (h = 4e-4*r) is 2.3e-4 relative on every derivative below.
                 for (std::size_t j = 0; j < 3; ++j) {
                     const std::size_t base = 3 * (((j + 1) * n) + i);
-                    const double h = static_cast<double>(pos[base + j]) -
-                                     static_cast<double>(pos[(3 * i) + j]);
                     const fixarray::vec3d bj{field[base + 0], field[base + 1], field[base + 2]};
-                    const double hj = h != 0.0 ? h : steps[i];
+                    const double hj = detail::realised_step(points[i].v[j], steps[i]);
                     d.grad_b_mag[j] = (fixarray::norm(bj) - d.b_mag) / hj;
                     for (std::size_t k = 0; k < 3; ++k) {
                         d.diff_b(k, j) = (bj[k] - d.b.v[k]) / hj;
@@ -744,14 +951,17 @@ template <int NMAX>
 /**
  * The guiding-centre geometry at every point of a batch — IRBEM's `COMPUTE_GRAD_CURV_CURL`.
  *
- * **A host loop, permanently, and the number that settles it:** 136 bytes cross the bus per point
- * (16 fp32 in, 18 out) for 11.6 ns of host arithmetic — measured, 2²⁰ points, `-O3 -march=native`,
- * 86 Mpts/s. At ~12 GB/s of effective PCIe bandwidth the transfer alone is ~11.3 ns/point, so
- * moving the data costs what computing it costs, *before* the ~30 µs submit floor and before a
- * single lane runs. Arithmetic intensity is ~0.4 flops/byte, which is below even the dipole
- * kernel's 0.5 — and `gpu/dispatch.hpp` already records that the dipole kernel LOSES 0.69× at
- * every batch size it was measured at. There is no size at which this one wins, so no kernel for
- * it exists in `gpu/irbem.slang` and none should be written.
+ * **A host loop, permanently, and the number that settles it.** 136 bytes would have to cross the
+ * bus per point (16 fp32 in, 18 out) for **19 ns of host arithmetic** — measured, 17.7 ns/point at
+ * 2¹⁰ and 19.9 at 2¹⁸, i.e. 50–57 Mpts/s, `-O3 -march=native -ffp-contract=off`. This seam's
+ * payload bandwidth is **7.15 GB/s**, measured directly by dispatching a *degree-1* IGRF kernel
+ * over 2²¹ points — 30 flops of kernel, so what is left is the round trip — which puts 136 B/point
+ * at **≥ 19.0 ns/point of transfer alone**. The copy costs exactly what the computation costs,
+ * before the kernel runs and before the ~115 µs dispatch floor is paid. Arithmetic intensity is
+ * ~0.4 flops/byte, below even the dipole kernel's 0.5 — and `gpu/dispatch.hpp` already records
+ * that the dipole kernel LOSES 0.69× at every batch size it was measured at. There is no size at
+ * which this one wins: the ratio is fixed, not amortizable. So no kernel for it exists in
+ * `gpu/irbem.slang` and none should be written.
  *
  * The routine is still worth having as a batch entry point: it keeps the loop in one place, it
  * vectorizes, and it lets a caller hand over an ephemeris rather than write the loop themselves.
@@ -790,10 +1000,12 @@ inline Status grad_curv_curl_batch(std::span<const BDerivatives> derivs,
  * neighbours. Two dispatches for three evaluations is the best a data dependency of this shape
  * allows, and it is still a factor of `N` better than the per-point loop the name suggests.
  *
- * fp32 costs nothing here. Only the SIGN of the difference survives, and the sign is unambiguous
- * everywhere except within ~10⁻⁴ Re of the magnetic equator, where the two hemispheres are
- * genuinely adjacent and no precision decides the question. That is the one routine in this file
- * the device lane serves at no accuracy cost at all.
+ * fp32 costs almost nothing here, because only the SIGN of the difference survives. Measured over
+ * 2¹⁸ random points spanning `r = 1.5 … 8.5`, the device lane and the fp64 host lane disagree on
+ * **11 points in 262 144** — 4 × 10⁻⁵ — and every one of them is a point sitting within a step of
+ * the magnetic equator, where `d|B|/ds` passes through zero and the two hemispheres are genuinely
+ * adjacent. No precision decides that question; a point *on* the equator is in neither hemisphere.
+ * Measured speedup: 0.51× at 128 points, 0.97× at 256, 3.76× at 1 024, **25.4×** at 2¹⁴.
  *
  * @tparam NMAX the IGRF truncation degree.
  * @param model the internal field model, already built for the epoch.
@@ -806,6 +1018,7 @@ inline Status grad_curv_curl_batch(std::span<const BDerivatives> derivs,
  * @alloc none on the host lane. The device lane stages `9N` floats each way.
  * @test IrbemField.HemisphereBatchAgreesWithTheReferenceLane
  * @test IrbemField.HemisphereBatchUsesTheDeviceWhenOneIsAvailable
+ * @test IrbemField.TheDeviceLaneReportsAPointWithNoField
  */
 template <int NMAX>
 [[nodiscard]] inline Result<bool> hemisphere_batch(const Igrf<NMAX>& model,
@@ -818,7 +1031,7 @@ template <int NMAX>
     if (n == 0) return {Status::Ok, false};
 
 #ifdef CHEATAH_SPACE_IRBEM_FIELD_GPU
-    if (gpu::prefer_gpu("irbem_igrf_f32", 2 * n)) {
+    if (detail::prefer_device(n, hemisphere_batch_crossover)) {
         std::vector<float> pos(3 * n);
         std::vector<float> base(3 * n);
         detail::interleave(points, pos);

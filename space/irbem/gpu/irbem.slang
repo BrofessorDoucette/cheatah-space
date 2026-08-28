@@ -570,3 +570,345 @@ void irbem_shell_foot_f32(uint3 tid : SV_DispatchThreadID) {
 }
 
 #endif  // KERNEL_SHELL
+
+// =============================================================================================
+// irbem_t89_f32 — Tsyganenko (1989), the external magnetospheric field, one thread per point.
+//
+// The first EXTERNAL model behind this seam, and the best-shaped one of its family: pure
+// straight-line closed-form arithmetic, no loop, no data-dependent branch, ~400 flops with exactly
+// one exp, thirteen sqrt and NO trigonometry (the tilt arrives as its sine and cosine, resolved
+// once per epoch on the host). Contrast the two kernels above — the streaming dipole at 0.5
+// flops/byte LOSES 0.69x, IGRF at ~20 wins 8.96x. T89 is ~11 flops/byte for 24 bytes in and 12
+// out, which puts it squarely in the regime where the device pays.
+//
+// PHYSICS. Tsyganenko, "A magnetospheric magnetic field model with a warped tail current sheet",
+// Planet. Space Sci. 37(1):5-20 (1989). Four contributions, each of them the curl of a vector
+// potential A = {0, A(rho,z), 0}:
+//
+//   tail          eqs. (12)-(15)   two disc potentials, thickened, warped, truncated by W(x,y)
+//   ring current  eqs. (16)-(17)   the third disc potential, the only one with a finite moment
+//   closure       eqs. (18)-(19)   two planar sheets at z = -+R_T, the return current
+//   Chapman-      eq.  (20)        a low-order polynomial in y,z under an exp(x/dx) envelope
+//   Ferraro
+//
+// With P = A_phi/rho the curl of A = P*(-y, x, 0) is Bx = -x dP/dz, By = -y dP/dz,
+// Bz = 2P + x dP/dx + y dP/dy — which is where the paper's field expressions come from and the
+// form evaluated here. Every d/dx and d/dy below is the exact derivative of the line above it;
+// dropping any of them breaks div B = 0, which is precisely what the host suite's
+// finite-difference divergence test looks for.
+//
+// TWO COORDINATE SYSTEMS, and the paper says so in as many words: eqs. (12)-(17) are evaluated in
+// SM (the dipole axis IS z, because the current sheet is defined by its departure from the dipole
+// equator) and eqs. (18)-(20) in GSM (the closure sheets are parallel to the GSM equator). The
+// kernel takes GSM in, rotates about y by the tilt, and rotates back. Evaluating the tail term in
+// GSM is the obvious-looking simplification and misplaces the sheet by x*tan(psi).
+//
+// This mirrors space/irbem/ext_t89.hpp's t89_components<float> expression for expression, so a
+// disagreement between the two is attributable to the DEVICE (a contraction, a driver's exp) and
+// not to the arithmetic having been written differently on the two sides.
+//
+// bindings: 0 pos (3N floats, GSM, Re) | 1 out (3N floats, nT, GSM)
+//           2 params (30 floats: sin psi, cos psi, C1..C19, dx, a_rc, D0, gamma_rc, Rc, G,
+//                     a_T, Dy, x0)
+//           3 dims {N}
+// =============================================================================================
+#ifdef KERNEL_T89
+
+[[vk::binding(0, 0)]] StructuredBuffer<float>   t89_pos;
+[[vk::binding(1, 0)]] RWStructuredBuffer<float> t89_out;
+[[vk::binding(2, 0)]] StructuredBuffer<float>   t89_params;
+[[vk::binding(3, 0)]] StructuredBuffer<uint>    t89_dims;
+
+// The parameters Tsyganenko (1989) sections 3 and 4 hold FIXED across every Kp bin. Spelled out
+// here rather than passed, because they are the same in all seven sets and a uniform read of a
+// literal costs nothing.
+static const float kT89Ly    = 10.0f;   // L_y  : dawn-dusk scale of the sheet's bending, eq. (11)
+static const float kT89Dx    = 13.0f;   // D_x  : sunward scale of the truncation factor W
+static const float kT89Lrc   = 5.0f;    // L_RC : scale of the ring-current thickness profile
+static const float kT89Lt    = 6.3f;    // L_T  : scale of the tail thickness profile
+static const float kT89GamT  = 4.0f;    // gamma_T : dayside thickness increment (the pinned one)
+static const float kT89Delta = 0.01f;   // delta   : flank thickening rate
+static const float kT89Gam1  = 1.0f;    // gamma_1 : far-tail thickening amplitude
+static const float kT89Rt    = 30.0f;   // R_T  : the closure sheets sit at z = -+R_T
+static const float kT89X0c   = 4.0f;    // x_0c : where W_c makes its transition
+static const float kT89Lxc2  = 50.0f;   // L_xc^2, as the paper states it
+static const float kT89Dyc2  = 20.0f;   // D_yc^2, likewise
+static const float kT89Hinge = 16.0f;   // the (4 Re)^2 rounding the hinge in eq. (11)
+static const float kT89H1off = 16.0f;   // the 16 Re offset in h_1
+static const float kT89H1sc2 = 36.0f;   // the (6 Re)^2 scale in h_1
+
+[shader("compute")]
+[numthreads(256, 1, 1)]
+void irbem_t89_f32(uint3 tid : SV_DispatchThreadID) {
+    const uint n = t89_dims[0];
+    const uint i = tid.x;
+    if (i >= n) return;   // the grid is rounded up to a multiple of 256; the tail does nothing
+
+    const float x = t89_pos[3 * i + 0];
+    const float y = t89_pos[3 * i + 1];
+    const float z = t89_pos[3 * i + 2];
+
+    const float sps = t89_params[0];
+    const float cps = t89_params[1];
+    const float c1 = t89_params[2], c2 = t89_params[3], c3 = t89_params[4];
+    const float c4 = t89_params[5], c5 = t89_params[6];
+    const float delta_x = t89_params[21], a_rc = t89_params[22], d0 = t89_params[23];
+    const float gam_rc  = t89_params[24], rc   = t89_params[25], gg = t89_params[26];
+    const float a_t     = t89_params[27], d_y  = t89_params[28], x0 = t89_params[29];
+
+    const float tps = sps / cps;
+
+    // ---- GSM -> SM: one rotation about y by the tilt -----------------------------------------
+    const float xs = x * cps - z * sps;
+    const float ys = y;
+    const float zs = x * sps + z * cps;
+
+    // ---- eq. (11): the warped sheet surface and its slopes -----------------------------------
+    const float hinge = xs + rc;
+    const float hroot = sqrt(hinge * hinge + kT89Hinge);
+    const float y2 = ys * ys;
+    const float y4 = y2 * y2;
+    const float ly2 = kT89Ly * kT89Ly;
+    const float ly4 = ly2 * ly2;
+    const float bden = y4 + ly4;
+    const float sheet = 0.5f * tps * (hinge - hroot) - gg * sps * y4 / bden;
+    const float dsdx = 0.5f * tps * (1.0f - hinge / hroot);
+    const float dsdy = -gg * sps * 4.0f * ys * y2 * ly4 / (bden * bden);
+
+    const float zr = zs - sheet;
+    const float rho2 = xs * xs + ys * ys;
+
+    // ---- eq. (13): the thickness profiles and their slopes -----------------------------------
+    const float lt2 = kT89Lt * kT89Lt;
+    const float lrc2 = kT89Lrc * kT89Lrc;
+    const float rtr = sqrt(xs * xs + lt2);
+    const float rrr = sqrt(xs * xs + lrc2);
+    const float xh1 = xs + kT89H1off;
+    const float h1r = sqrt(xh1 * xh1 + kT89H1sc2);
+    const float h_t  = 0.5f * (1.0f + xs / rtr);
+    const float h_rc = 0.5f * (1.0f + xs / rrr);
+    const float h_1  = 0.5f * (1.0f - xh1 / h1r);
+    const float dh_t  = 0.5f * lt2 / (rtr * rtr * rtr);
+    const float dh_rc = 0.5f * lrc2 / (rrr * rrr * rrr);
+    const float dh_1  = -0.5f * kT89H1sc2 / (h1r * h1r * h1r);
+
+    const float dT = d0 + kT89Delta * y2 + kT89GamT * h_t + kT89Gam1 * h_1;
+    const float dR = d0 + gam_rc * h_rc + kT89Gam1 * h_1;
+    const float ddTdx = kT89GamT * dh_t + kT89Gam1 * dh_1;
+    const float ddTdy = 2.0f * kT89Delta * ys;
+    const float ddRdx = gam_rc * dh_rc + kT89Gam1 * dh_1;
+
+    const float xiT = sqrt(zr * zr + dT * dT);
+    const float xiR = sqrt(zr * zr + dR * dR);
+    const float uT = a_t + xiT;
+    const float uR = a_rc + xiR;
+    const float sT = sqrt(rho2 + uT * uT);
+    const float sR = sqrt(rho2 + uR * uR);
+
+    // ---- eq. (13): the truncation factor W and its slopes ------------------------------------
+    const float xw = xs - x0;
+    const float dx2 = kT89Dx * kT89Dx;
+    const float wroot = sqrt(xw * xw + dx2);
+    const float wx = 0.5f * (1.0f - xw / wroot);
+    const float wy = 1.0f / (1.0f + y2 / (d_y * d_y));
+    const float W = wx * wy;
+    const float dWdx = wy * (-0.5f * dx2 / (wroot * wroot * wroot));
+    const float dWdy = wx * (-2.0f * ys / (d_y * d_y)) * wy * wy;
+    const float gradW = xs * dWdx + ys * dWdy;
+
+    // ---- eqs. (14)-(15): the tail current, in SM ----------------------------------------------
+    const float qT = (W / (xiT * sT)) * (c1 / (sT + uT) + c2 / (sT * sT));
+    const float bxT = qT * xs * zr;
+    const float byT = qT * ys * zr;
+    const float bzT = (W / sT) * (c1 + c2 * uT / (sT * sT))
+                    + gradW * (c1 + c2 / sT) / (sT + uT)
+                    + bxT * dsdx + byT * dsdy
+                    - qT * dT * (xs * ddTdx + ys * ddTdy);
+
+    // ---- eqs. (16)-(17): the ring current, in SM ----------------------------------------------
+    const float sR2 = sR * sR;
+    const float sR5 = sR2 * sR2 * sR;
+    const float qR = 3.0f * c5 * uR / (xiR * sR5);
+    const float bxR = qR * xs * zr;
+    const float byR = qR * ys * zr;
+    const float bzR = c5 * (2.0f * uR * uR - rho2) / sR5
+                    + bxR * dsdx + byR * dsdy - qR * dR * xs * ddRdx;
+
+    // ---- SM -> GSM ----------------------------------------------------------------------------
+    const float bxsm = bxT + bxR, bysm = byT + byR, bzsm = bzT + bzR;
+    float bx = bxsm * cps + bzsm * sps;
+    float by = bysm;
+    float bz = -bxsm * sps + bzsm * cps;
+
+    // ---- eqs. (18)-(19): the closure currents, in GSM ------------------------------------------
+    // The paper's -+ resolves |z -+ R_T| for a point BETWEEN the sheets; sgn(zeta) is identical
+    // there and keeps the expression finite outside, where the paper's spelling divides by zero.
+    float fx[2], fy[2], fz[2];
+    for (int k = 0; k < 2; ++k) {
+        const float side = (k == 0) ? 1.0f : -1.0f;
+        const float zeta = z + side * kT89Rt;
+        const float S = sqrt(zeta * zeta + x * x + y * y);
+        const float sgn = (zeta >= 0.0f) ? 1.0f : -1.0f;
+        const float den = S + sgn * zeta;
+        const float xc = x - kT89X0c;
+        const float sc = sqrt(xc * xc + kT89Lxc2);
+        const float wcx = 0.5f * (1.0f - xc / sc);
+        const float wcy = 1.0f / (1.0f + y * y / kT89Dyc2);
+        const float wc = wcx * wcy;
+        const float dwcdx = wcy * (-0.5f * kT89Lxc2 / (sc * sc * sc));
+        const float dwcdy = wcx * (-2.0f * y / kT89Dyc2) * wcy * wcy;
+        const bool ok = den > 0.0f;
+        fx[k] = ok ? sgn * wc * x / (S * den) : 0.0f;
+        fy[k] = ok ? sgn * wc * y / (S * den) : 0.0f;
+        fz[k] = ok ? (wc / S + (x * dwcdx + y * dwcdy) / den) : 0.0f;
+    }
+    bx += c3 * (fx[0] + fx[1]) + c4 * (fx[0] - fx[1]) * sps;
+    by += c3 * (fy[0] + fy[1]) + c4 * (fy[0] - fy[1]) * sps;
+    bz += c3 * (fz[0] + fz[1]) + c4 * (fz[0] - fz[1]) * sps;
+
+    // ---- eq. (20): the Chapman-Ferraro and Birkeland systems, in GSM ---------------------------
+    const float env = exp(x / delta_x);
+    const float z2 = z * z;
+    bx += env * (t89_params[7] * z * cps
+               + (t89_params[8] + t89_params[9] * y2 + t89_params[10] * z2) * sps);
+    by += env * (t89_params[11] * y * z * cps
+               + (t89_params[12] * y + t89_params[13] * y * y2 + t89_params[14] * y * z2) * sps);
+    bz += env * ((t89_params[15] + t89_params[16] * y2 + t89_params[17] * z2) * cps
+               + (t89_params[18] * z + t89_params[19] * z * y2 + t89_params[20] * z * z2) * sps);
+
+    t89_out[3 * i + 0] = bx;
+    t89_out[3 * i + 1] = by;
+    t89_out[3 * i + 2] = bz;
+}
+
+#endif  // KERNEL_T89
+
+// =============================================================================================
+// irbem_trace_path_f32 — the field line WITH its path, one thread per line.
+//
+// THE OTHER SIDE OF THE ROOFLINE. irbem_trace_i_f32 above returns four floats per line for ~10^5
+// field evaluations — ~9 400 flops per byte moved, which is why it beats the host by 48.9x. This
+// kernel runs the SAME RK4 chain and writes every sample: 16 bytes per step instead of 16 bytes
+// per line. At the ~4 IGRF evaluations and ~500 flops each that one step costs, that is ~125
+// flops/byte — a factor of 75 down, and the crossover moves with it (measured: 4096 lines, versus
+// the tracer's 512). Two kernels, not one, because merging them would put a `posit` store in the
+// L* hot path and cost the module its whole performance argument.
+//
+// Implements space/irbem/trace_api.hpp's trace_field_line_toward_earth: a FIXED step (not the
+// L-proportional one — a caller asking for a path is sampling for a plot and wants uniform
+// spacing), in the direction of increasing |B|, from the input point to the first sample inside
+// R0. The direction is chosen by probing BOTH neighbours and taking the larger |B|; comparing one
+// neighbour against the start picks the wrong hemisphere within a step of the magnetic equator,
+// which the host lane's own history records.
+//
+// fp32 is a real choice here and not a free one. The tracer above accumulates one scalar; this
+// one accumulates a POSITION over hundreds of steps, and each step's rounding is carried forward.
+// MEASURED against the fp64 host lane, 512 lines x ~250 steps at ds = 0.02 Re: 5.0e-7 R_E at the
+// first sample and 6.2e-6 R_E (~40 metres) at the last, i.e. the error GROWS along the path, and
+// |B| agrees to 2.0e-5 relative. Sample counts were identical on every line. That last-sample
+// figure is a factor of 28 inside the path-geometry agreement the fp64 host lane itself has with
+// the reference implementation (1.8e-4 R_E), so this lane is fit for plotting and for a
+// drift-shell sweep -- and it is NOT fit for anything that differentiates the path, where 4e-5
+// relative on a 0.02 Re step is first-order noise. Said here so it is not discovered later.
+//
+// bindings: 0 pos (3N floats, GEO, Re) | 1 coef | 2 norm
+//           3 path (3*M*N floats, GEO, Re) | 4 bmag (M*N floats, nT)
+//           5 report (2N uints: sample count, status) | 6 dims
+// dims: {N, nmax, M, ds_x1e6, r0_x1e6}
+// =============================================================================================
+#ifdef KERNEL_TRACE_PATH
+
+static const uint kPathStatusOk = 0u;
+static const uint kPathStatusNotConverged = 3u;   // matches Status::NotConverged
+static const uint kPathStatusOpenFieldLine = 2u;  // matches Status::OpenFieldLine
+static const uint kPathStatusDomainError = 5u;    // matches Status::DomainError
+
+[[vk::binding(0, 0)]] StructuredBuffer<float>   tp_pos;
+[[vk::binding(1, 0)]] StructuredBuffer<float>   tp_coef;
+[[vk::binding(2, 0)]] StructuredBuffer<float>   tp_norm;
+[[vk::binding(3, 0)]] RWStructuredBuffer<float> tp_path;
+[[vk::binding(4, 0)]] RWStructuredBuffer<float> tp_bmag;
+[[vk::binding(5, 0)]] RWStructuredBuffer<uint>  tp_report;
+[[vk::binding(6, 0)]] StructuredBuffer<uint>    tp_dims;
+
+/// The unit tangent B/|B|, or zero where the field vanishes.
+float3 tp_unit(float3 b) {
+    const float m = length(b);
+    return m > 0.0f ? b / m : float3(0.0f, 0.0f, 0.0f);
+}
+
+/// One RK4 step along dx/ds = B/|B|, carrying the arrival field forward as the next step's k1 —
+/// the same 20% saving the invariant tracer takes.
+float3 tp_rk4(int nmax, int slots, float3 p, float3 b_here, float ds, out float3 b_next) {
+    const float3 k1 = tp_unit(b_here);
+    const float3 k2 = tp_unit(igrf_eval(tp_coef, tp_norm, nmax, slots, p + k1 * (ds * 0.5f)));
+    const float3 k3 = tp_unit(igrf_eval(tp_coef, tp_norm, nmax, slots, p + k2 * (ds * 0.5f)));
+    const float3 k4 = tp_unit(igrf_eval(tp_coef, tp_norm, nmax, slots, p + k3 * ds));
+    const float3 out_p = p + (k1 + k2 * 2.0f + k3 * 2.0f + k4) * (ds / 6.0f);
+    b_next = igrf_eval(tp_coef, tp_norm, nmax, slots, out_p);
+    return out_p;
+}
+
+[shader("compute")]
+[numthreads(256, 1, 1)]
+void irbem_trace_path_f32(uint3 tid : SV_DispatchThreadID) {
+    const uint n_lines = tp_dims[0];
+    const int nmax = int(tp_dims[1]);
+    const uint max_points = tp_dims[2];
+    const float ds_mag = float(tp_dims[3]) * 1.0e-6f;
+    const float r0 = float(tp_dims[4]) * 1.0e-6f;
+    // PathTraceOptions::max_steps. It rides in the dims buffer because the host loop is bounded by
+    // it and not by the buffer: without it a caller who caps the step count gets one answer with a
+    // device present and another without, which is exactly the silent lane-dependence the batch
+    // entry point exists to rule out. Measured before it was carried: at max_steps = 10 all 1024
+    // lines of a batch disagreed (device 80 samples / Ok, host 11 / OpenFieldLine).
+    const uint max_steps = tp_dims[5];
+    const uint i = tid.x;
+    if (i >= n_lines) return;
+
+    const int slots = ((nmax + 1) * (nmax + 2)) / 2;
+    const uint base = i * max_points;
+    const float3 start = float3(tp_pos[3 * i + 0], tp_pos[3 * i + 1], tp_pos[3 * i + 2]);
+
+    tp_report[2 * i + 0] = 0u;
+    tp_report[2 * i + 1] = kPathStatusDomainError;
+    if (!(length(start) > r0) || max_points == 0u) return;
+
+    float3 b = igrf_eval(tp_coef, tp_norm, nmax, slots, start);
+    const float b_start = length(b);
+    if (!(b_start > 0.0f)) return;
+
+    // Direction: probe both neighbours, take the larger |B|. See the block comment above.
+    float3 up;
+    float3 down;
+    tp_rk4(nmax, slots, start, b, ds_mag, up);
+    tp_rk4(nmax, slots, start, b, -ds_mag, down);
+    const float ds = length(up) >= length(down) ? ds_mag : -ds_mag;
+
+    tp_path[3 * base + 0] = start.x;
+    tp_path[3 * base + 1] = start.y;
+    tp_path[3 * base + 2] = start.z;
+    tp_bmag[base] = b_start;
+    uint n = 1u;
+
+    float3 p = start;
+    uint status = kPathStatusOpenFieldLine;
+    for (uint k = 0u; k < max_steps; ++k) {
+        if (n == max_points) { status = kPathStatusNotConverged; break; }
+        float3 b_new;
+        const float3 q = tp_rk4(nmax, slots, p, b, ds, b_new);
+        tp_path[3 * (base + n) + 0] = q.x;
+        tp_path[3 * (base + n) + 1] = q.y;
+        tp_path[3 * (base + n) + 2] = q.z;
+        tp_bmag[base + n] = length(b_new);
+        ++n;
+        if (length(q) < r0) { status = kPathStatusOk; break; }
+        p = q;
+        b = b_new;
+    }
+
+    tp_report[2 * i + 0] = n;
+    tp_report[2 * i + 1] = status;
+}
+
+#endif  // KERNEL_TRACE_PATH

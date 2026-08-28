@@ -24,6 +24,8 @@
  *    (that global state is precisely what makes the reference impossible to thread or offload);
  *  - @ref datetime.hpp, @ref coords_rotations.hpp, @ref coords_geodetic.hpp, @ref coords_helio.hpp;
  *  - @ref igrf.hpp — the internal field, and the hottest kernel in the library;
+ *  - @ref ext_t89.hpp — Tsyganenko (1989), the first EXTERNAL field model: the magnetosphere's own
+ *    currents, without which a drift shell traced through IGRF alone is a dipole exercise;
  *  - @ref gpu/dispatch.hpp — the device seam, present only when the GPU stack is on the include
  *    path and reporting itself unavailable rather than failing when it is not.
  *
@@ -39,6 +41,7 @@
 #include "coords_geodetic.hpp"
 #include "coords_helio.hpp"
 #include "igrf.hpp"
+#include "ext_t89.hpp"
 
 // The device lane is opt-in by include path, exactly as space.time's ndarray support is: a program
 // built without cheatah-gpu-linalg still compiles every routine here and simply has no GPU.

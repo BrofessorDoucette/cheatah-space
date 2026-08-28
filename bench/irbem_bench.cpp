@@ -8,9 +8,9 @@
  * Every performance claim this module makes has to come from here. Before this file existed the
  * headers carried prose ("306 ns/eval", "8.37x the host") that nothing regenerated and nothing
  * checked, and a prose number is a number that silently rots the first time somebody reorders a
- * loop. `scripts/bench_table.sh` runs this binary and GENERATES the README table from its JSON, so
- * a number in the documentation is by construction a number this binary measured on the machine
- * that printed it.
+ * loop. `scripts/bench_run.sh` runs this binary and GENERATES the tables of
+ * `space/irbem/BENCHMARKS.md` from its JSON, so a number in the documentation is by construction a
+ * number this binary measured on the machine that printed it.
  *
  * ### Three lanes, one row
  *
@@ -22,7 +22,7 @@
  *    for it; see @ref gpu_status, which derives that rather than asserting it.
  *  - **IRBEM** — the vendored Fortran library, `dlopen`ed as a black box (the clean-room rule: run
  *    it, never read it) through the entry points documented in `matlab/libirbem.h` and
- *    `docs/source/api/*.rst`.
+ *    `docs/source/api/` .rst files.
  *
  * The IRBEM lane quotes the `-O2` REBUILD, never the shipped binary. IRBEM's own makefile passes no
  * `-O` at all and `docs/ERROR_BUDGET.md` §5 measures the shipped library at 2.7x the `-O2` one:
@@ -59,15 +59,24 @@
  * and dates spread across the whole IGRF-valid span. It is deterministic — the same points on every
  * run, so a regression is a regression and not a different sample.
  *
- * @note No allocation happens inside any timed loop. The input set is built once at start-up; the
- *       batch lanes write into buffers sized once. Measured with Valgrind: the allocation count is
- *       identical at 1e3 and 1e5 repetitions of every scalar routine.
+ * @note No allocation happens inside any HOST timed loop. The input set is built once at start-up
+ *       and the batch lanes write into buffers sized once, so a longer run must not allocate more.
+ *       Verified with `valgrind --tool=memcheck`, reading `total heap usage`, at two iteration
+ *       counts a hundred times apart: `BM_cpu_julian_day_number` 1213/1213 and
+ *       `BM_cpu_geo_to_gdz` 1156/1156 and `BM_cpu_igrf_evaluate_deg13` 1251/1251 at 200x and
+ *       20000x; `BM_cpu_trace_invariant` 1202/1202 and `BM_cpu_igrf_batch` 1162/1162 at 3x and
+ *       60x. Identical in every case, so nothing in a timed loop reaches the heap.
+ *
+ *       The DEVICE lanes are excluded from that claim and do allocate per launch — staging vectors
+ *       and pooled device buffers — which is a property of the seam, not of this file, and is
+ *       inside the timed region because a caller pays it.
  */
 
 #include <benchmark/benchmark.h>
 #include <dlfcn.h>
 
 #include <array>
+#include <cctype>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -83,6 +92,7 @@
 #include "space/irbem/coords_geodetic.hpp"
 #include "space/irbem/coords_helio.hpp"
 #include "space/irbem/coords_rotations.hpp"
+#include "space/irbem/ext_t89.hpp"
 #include "space/time/calendar.hpp"
 #include "space/irbem/gpu/dispatch.hpp"
 #include "space/irbem/igrf.hpp"
@@ -171,9 +181,11 @@ constexpr double kRefUt = 43200.0; ///< UT seconds of the reference epoch (12:00
 ///
 /// The sweep is deliberate rather than random: `k/kPoints` walks radius from 1.5 to 8 Re (the inner
 /// belt out past geosynchronous), longitude through a full turn, and latitude through +-58 deg, so
-/// no lane sees a repeated value, an axis, a pole or the origin. Dates step ~2 years from 1905 so
+/// no lane sees a repeated value, an axis, a pole or the origin. Dates step 2 years from 1903 so
 /// the IGRF interpolation bracket moves, leap years and century non-leap years are both crossed,
-/// and every instant stays inside the model's `[1900, 2030]` validity.
+/// and every instant stays inside the model's `[1900, 2030]` validity — which the 1905 start this
+/// began with did NOT: it put the last of the 64 dates at 2031 and the oracle said so, once per
+/// run, in a warning nobody was reading.
 ///
 /// @return the populated set; it is a function-local static, built on first use.
 /// @complexity O(kPoints + kBatch).
@@ -181,7 +193,11 @@ constexpr double kRefUt = 43200.0; ///< UT seconds of the reference epoch (12:00
 ///        loop.
 const Inputs& inputs() {
     static const Inputs* built = [] {
+        // `Rotations` has no default constructor — every rotation set belongs to an epoch — so it
+        // has to be initialised here; the two batch vectors are named alongside it only to keep
+        // -Wmissing-field-initializers quiet, and are resized properly further down.
         auto* in = new Inputs{
+            .batch_pos = {}, .batch_out = {},
             .rotations = Rotations::at(2451545.0, DipoleCoefficients{-29404.8, -1450.9, 4652.5})};
         for (std::size_t k = 0; k < kPoints; ++k) {
             const double t = static_cast<double>(k) / static_cast<double>(kPoints);
@@ -206,7 +222,12 @@ const Inputs& inputs() {
             in->hee[k] = Position<Frame::HEE>{in->hae[k].v};
             in->heeq[k] = Position<Frame::HEEQ>{in->hae[k].v};
 
-            const int year = 1905 + static_cast<int>(2 * k);
+            // 1903 + 2k, so the last of kPoints = 64 dates is 2029 and every instant is
+            // inside IGRF's [1900, 2030] span. It used to start at 1905, which put the
+            // last date at 2031 and made the oracle print
+            //   *** WARNING -- Input year = 2031.50 is out of valid range 1900-2030
+            // on every run: one point in sixty-four was timing IRBEM's clamp path.
+            const int year = 1903 + static_cast<int>(2 * k);
             const int month = 1 + static_cast<int>(k % 12);
             const int day = 1 + static_cast<int>(k % 28);
             const int hour = static_cast<int>(k % 24);
@@ -267,7 +288,7 @@ template <class T>
     return q;
 }
 
-/// Record how many points a benchmark processed, so `bench_table.sh` can derive ns/point from
+/// Record how many points a benchmark processed, so `bench_run.sh` can derive ns/point from
 /// `items_per_second` uniformly across scalar, batched and device lanes.
 /// @param state the benchmark state, after its loop has run.
 /// @param per_iteration how many points one iteration processed.
@@ -326,6 +347,15 @@ struct Oracle {
     /// `options(1) = 1` the drift-shell one too.
     void (*make_lstar)(int*, int*, int*, int*, int*, int*, double*, double*, double*, double*,
                        double*, double*, double*, double*, double*, double*, double*) = nullptr;
+    /// `make_lstar_shell_splitting1(ntime, Nipa, kext, options, sysaxes, iyear, idoy, ut,
+    /// x1, x2, x3, alpha, maginput, Lm, Lstar, Bmirr, Bmin, XJ, MLT)` — the SAME calculation for an
+    /// arbitrary local pitch angle, and therefore the one that is actually the counterpart of
+    /// @ref BM_cpu_trace_invariant. `make_lstar` above is documented as computing "the L\* parameter
+    /// for locally mirroring particles (local pitch angle of 90 degrees)"
+    /// (`docs/source/api/magnetic_coordinates.rst`), which integrates a different arc.
+    void (*make_lstar_ss)(int*, int*, int*, int*, int*, int*, int*, double*, double*, double*,
+                          double*, double*, double*, double*, double*, double*, double*, double*,
+                          double*) = nullptr;
 };
 
 /// Where the oracle is expected. The `-O2` REBUILD, never the shipped binary — see the file brief.
@@ -370,6 +400,8 @@ const Oracle& oracle() {
         out->hee2gse = reinterpret_cast<decltype(out->hee2gse)>(sym("hee2gse1_"));
         out->get_field = reinterpret_cast<decltype(out->get_field)>(sym("get_field1_"));
         out->make_lstar = reinterpret_cast<decltype(out->make_lstar)>(sym("make_lstar1_"));
+        out->make_lstar_ss =
+            reinterpret_cast<decltype(out->make_lstar_ss)>(sym("make_lstar_shell_splitting1_"));
         return out;
     }();
     return *o;
@@ -1491,6 +1523,89 @@ void BM_gpu_dipole_field_batch(benchmark::State& state) {
 BENCHMARK(BM_gpu_dipole_field_batch)->Unit(benchmark::kMillisecond)->UseRealTime();
 
 // ---------------------------------------------------------------------------------------------
+// ext_t89.hpp — the first routine this module has that is PARAMETERIZED BY ACTIVITY
+// ---------------------------------------------------------------------------------------------
+
+/// The dipole tilt every T89 lane is measured at, radians.
+///
+/// ~20°, which is a real northern-summer tilt rather than the ψ = 0 special case: at ψ = 0 the
+/// `sin ψ` terms of Tsyganenko (1989) eq. (2)–(10) drop out and the model evaluates a strictly
+/// cheaper expression than it ever does in flight. Benchmarking the tilt-free case would be
+/// benchmarking a branch of the model no orbit sits on.
+constexpr double kT89TiltRad = 0.35;
+
+/// `t89_field` at one Kp — the storm sweep, and the reason this section exists.
+///
+/// Every other row of this suite is measured at quiet conditions, because until `ext_t89.hpp`
+/// landed there was nothing in the module that took an activity index at all. There is now, and a
+/// benchmark suite for a radiation-belt library that only ever measures `maginput = 0` is measuring
+/// the one condition the library does not exist for. `state.range(0)` is Kp in IRBEM's `maginput`
+/// slot-1 scaling — Kp × 10, 0…90 (`docs/source/api/general_information.rst`) — swept across the
+/// whole published envelope, so the extreme-storm bin is measured, not assumed to cost the same.
+///
+/// T89 selects one of seven coefficient sets by Kp and then evaluates the same closed form, so the
+/// sweep is expected to be FLAT in time. That is the point: a flat sweep is a measured result about
+/// this model, published, rather than an assumption that let nine tenths of the parameter space go
+/// untimed. A model whose cost does vary with activity — a T96 or a T01 root-find — would show it
+/// here.
+/// @param state the benchmark state; `range(0)` is Kp × 10.
+/// @complexity O(kPoints) per iteration.
+/// @alloc none.
+void BM_cpu_t89_field(benchmark::State& state) {
+    const Inputs& in = inputs();
+    const auto kp10 = static_cast<double>(state.range(0));
+    for (auto _ : state) {
+        const Position<Frame::GSM>* p = opaque(in.gsm.data());
+        for (std::size_t k = 0; k < kPoints; ++k) {
+            benchmark::DoNotOptimize(t89_field(p[k], kT89TiltRad, kp10));
+        }
+    }
+    set_points(state, kPoints);
+}
+BENCHMARK(BM_cpu_t89_field)->DenseRange(0, 90, 10);
+
+/// IRBEM's `get_field1` with `kext = 4` — Tsyganenko (1989c), the counterpart of
+/// @ref BM_cpu_t89_field, at the same Kp.
+///
+/// `kext = 4` is the documented selector for T89 and it "uses 0 ≤ Kp ≤ 9, valid for rGEO ≤ 70 Re"
+/// (`docs/source/api/general_information.rst`); `maginput(1)` carries Kp × 10. The internal field is
+/// left at IGRF (`options(5) = 0`) on both sides, so the difference between the two rows is the
+/// external model and the frame work around it, which is what a caller pays.
+/// @param state the benchmark state; `range(0)` is Kp × 10.
+/// @complexity O(kPoints) per iteration.
+/// @alloc none inside the loop.
+void BM_irbem_get_field_t89(benchmark::State& state) {
+    const Oracle& o = oracle();
+    if (oracle_missing(state, reinterpret_cast<const void*>(o.get_field))) return;
+    const Inputs& in = inputs();
+    std::array<double, 25> maginput{};
+    maginput[0] = static_cast<double>(state.range(0));   // Kp x 10, slot 1
+    for (auto _ : state) {
+        const Position<Frame::GSM>* p = opaque(in.gsm.data());
+        const DateInput* d = opaque(in.dates.data());
+        for (std::size_t k = 0; k < kPoints; ++k) {
+            int kext = 4;  // Tsyganenko [1989c]
+            std::array<int, 5> options{0, 0, 0, 0, 0};
+            int sysaxes = 2;  // GSM Cartesian, Re
+            int y = d[k].year;
+            int doy = d[k].doy;
+            double ut = d[k].ut;
+            double x1 = p[k].v[0];
+            double x2 = p[k].v[1];
+            double x3 = p[k].v[2];
+            std::array<double, 3> bgeo{};
+            double bl = 0.0;
+            o.get_field(&kext, options.data(), &sysaxes, &y, &doy, &ut, &x1, &x2, &x3,
+                        maginput.data(), bgeo.data(), &bl);
+            benchmark::DoNotOptimize(bgeo);
+            benchmark::DoNotOptimize(bl);
+        }
+    }
+    set_points(state, kPoints);
+}
+BENCHMARK(BM_irbem_get_field_t89)->DenseRange(0, 90, 10);
+
+// ---------------------------------------------------------------------------------------------
 // lstar.hpp — the trace, the second invariant, and the CROSSOVER the module argues from
 // ---------------------------------------------------------------------------------------------
 
@@ -1715,8 +1830,15 @@ void BM_gpu_trace_batch(benchmark::State& state) {
 }
 BENCHMARK(BM_gpu_trace_batch)->Apply(crossover_sizes);
 
+/// IRBEM's `NALPHA_MAX` — the fixed second dimension of every per-pitch-angle output array.
+/// `docs/source/api/general_information.rst` fixes it at 25, and the arrays are that long whatever
+/// `Nipa` is, so under-sizing one is a stack smash rather than a wrong number.
+constexpr std::size_t kNalphaMax = 25;
+
 /// IRBEM's `make_lstar1` with `options(1) = 0` — trace, `L_m`, `B_min` and `XJ`, and NO drift
-/// shell. The like-for-like against @ref BM_cpu_trace_invariant plus @ref BM_cpu_mcilwain_l.
+/// shell, for a LOCALLY MIRRORING particle (α = 90°, see the note on
+/// @ref BM_irbem_make_lstar_pitch). Kept as a variant rather than as the trace comparison, because
+/// it does not integrate the arc this suite's lines integrate.
 ///
 /// `options` is the documented five-element control array (`docs/source/api/make_lstar.rst`):
 /// `(1)` whether to compute L\*, `(2)` the IGRF re-initialisation cadence, `(3)`/`(4)` the drift
@@ -1764,6 +1886,65 @@ BENCHMARK_CAPTURE(bench_irbem_make_lstar, trace, 0)
 BENCHMARK_CAPTURE(bench_irbem_make_lstar, full, 1)
     ->Name("BM_irbem_make_lstar_full")
     ->Unit(benchmark::kMicrosecond);
+
+/// IRBEM's `make_lstar_shell_splitting1` at THIS suite's own pitch angles — the like-for-like
+/// counterpart of @ref BM_cpu_trace_invariant, and the row the trace comparison must be read from.
+///
+/// `make_lstar1` is not that counterpart, and the table used to say it was. IRBEM's own
+/// documentation (`docs/source/api/magnetic_coordinates.rst`) states that `MAKE_LSTAR` "computes
+/// the L\* parameter for locally mirroring particles (local pitch angle of 90 degrees)" and refers
+/// the reader to `MAKE_LSTAR_SHELL_SPLITTING` "to compute L\* for arbitrary pitch angles". A
+/// locally mirroring particle mirrors AT the spacecraft, so its `I` integral spans the short arc
+/// between the point and its conjugate; this suite's lines mirror at `B_local / sin²α` for
+/// α = 30…80°, which is up to four times the local field and a far longer arc. Measured at the same
+/// eight start points, `XJ` comes back 1.85 Re from the shell-splitting call against 5.5e-03 Re
+/// from `make_lstar1` at L = 2 — two different integrals, not two implementations of one.
+///
+/// Called with `Nipa = 1`. At α = 90° this entry point reproduces `make_lstar1`'s `Lm` and `XJ` to
+/// every printed digit and costs about twice as much (30.8 µs against 15.7 µs on this machine), so
+/// roughly a 2× constant of its own is inside this row; everything above that is the longer arc.
+///
+/// @param state the benchmark state.
+/// @complexity O(steps) field evaluations per call, serial.
+/// @alloc none inside the loop.
+void BM_irbem_make_lstar_pitch(benchmark::State& state) {
+    const Oracle& o = oracle();
+    if (oracle_missing(state, reinterpret_cast<const void*>(o.make_lstar_ss))) return;
+    const TraceInputs& tr = trace_inputs();
+    std::size_t k = 0;
+    for (auto _ : state) {
+        int ntime = 1;
+        int nipa = 1;
+        int kext = 0;
+        int sysaxes = 1;  // GEO Cartesian, Re
+        std::array<int, 5> options{0, 0, 0, 0, 0};
+        std::array<int, 1> iyear{kRefYear};
+        std::array<int, 1> idoy{kRefDoy};
+        std::array<double, 1> ut{kRefUt};
+        std::array<double, 1> x1{tr.starts[k].v[0]};
+        std::array<double, 1> x2{tr.starts[k].v[1]};
+        std::array<double, 1> x3{tr.starts[k].v[2]};
+        // NALPHA_MAX is 25 (docs/source/api/general_information.rst) and the outputs are
+        // [ntime, NALPHA_MAX], so every per-pitch-angle array is sized 25 even at Nipa = 1.
+        std::array<double, kNalphaMax> alpha{};
+        alpha[0] = tr.pitch_deg[k];
+        std::array<double, 25> maginput{};
+        std::array<double, kNalphaMax> lm{};
+        std::array<double, kNalphaMax> lstar{};
+        std::array<double, kNalphaMax> bmirr{};
+        std::array<double, kNalphaMax> xj{};
+        std::array<double, 1> bmin{};
+        std::array<double, 1> mlt{};
+        o.make_lstar_ss(&ntime, &nipa, &kext, options.data(), &sysaxes, iyear.data(), idoy.data(),
+                        ut.data(), x1.data(), x2.data(), x3.data(), alpha.data(), maginput.data(),
+                        lm.data(), lstar.data(), bmirr.data(), bmin.data(), xj.data(), mlt.data());
+        benchmark::DoNotOptimize(lm);
+        benchmark::DoNotOptimize(xj);
+        k = (k + 1) % kTraceMax;
+    }
+    set_points(state, 1);
+}
+BENCHMARK(BM_irbem_make_lstar_pitch)->Unit(benchmark::kMicrosecond);
 
 // ---------------------------------------------------------------------------------------------
 // igrf.hpp on the device — reached PAST the seam, which is the porting gap the table reports
@@ -1844,16 +2025,25 @@ const IgrfBatch& igrf_batch() {
 }
 
 /// `Igrf<13>::evaluate` over a whole batch, fp64 — the host lane of the IGRF comparison.
+///
+/// The model reference and the point array are hoisted out of the timed loop. They are loop
+/// invariants and a benchmark should hoist its invariants anyway, but there is a sharper reason
+/// here: with GCC 13.3 at `-O2` and above, dereferencing the `std::optional<Igrf<13>>` INSIDE the
+/// loop segfaulted, `evaluate` receiving a null point array. Not diagnosed past that — the loop is
+/// correct either way and this form is the one a benchmark should have had from the start — but it
+/// is recorded because "it worked at -O1" is exactly the shape of finding that gets forgotten.
 /// @param state the benchmark state.
 /// @complexity O(kIgrfBatch) evaluations per iteration, each O(NMAX^2).
 /// @alloc none inside the loop.
 void BM_cpu_igrf_batch(benchmark::State& state) {
     const Inputs& in = inputs();
     const IgrfBatch& b = igrf_batch();
+    const Igrf<13>& model = *in.igrf13;
+    const Position<Frame::GEO>* const points = b.geo64.data();
     for (auto _ : state) {
-        const Position<Frame::GEO>* p = opaque(b.geo64.data());
+        const Position<Frame::GEO>* p = opaque(points);
         for (std::size_t i = 0; i < kIgrfBatch; ++i) {
-            benchmark::DoNotOptimize(in.igrf13->evaluate(p[i]));
+            benchmark::DoNotOptimize(model.evaluate(p[i]));
         }
     }
     set_points(state, kIgrfBatch);
@@ -1861,14 +2051,14 @@ void BM_cpu_igrf_batch(benchmark::State& state) {
 BENCHMARK(BM_cpu_igrf_batch)->Unit(benchmark::kMillisecond)->UseRealTime();
 
 #ifdef CHEATAH_SPACE_IRBEM_LSTAR_GPU
-/// Launch `irbem_igrf_f32` — a launcher this benchmark has to own, because the seam has none.
+/// Launch `irbem_igrf_f32` over the staged batch, through `dispatch.hpp`'s own `launch_igrf`.
 ///
-/// `dispatch_batch` speaks the four-binding pos/out/params/dims shape; the IGRF kernel binds FIVE
-/// (pos, out, coef, norm, dims) and `launch_trace` is the tracer's own seven-binding launcher.
-/// There is no third launcher, so the kernel is registered, compiled and correct but unreachable
-/// through the public seam — which is exactly what @ref gpu_status reports for it, and what the
-/// "on GPU?" column exists to make visible. Reaching past the seam HERE, in a benchmark, is how
-/// the table can say what the missing launcher would be worth without pretending it exists.
+/// This used to be a launcher the benchmark owned, because the seam genuinely had none: the IGRF
+/// kernel binds five buffers (pos, out, coef, norm, dims) where `dispatch_batch` speaks four, and
+/// `launch_trace` is the tracer's own seven-binding one. `launch_igrf` since landed in the seam, so
+/// the duplicate is gone — a benchmark that reaches past the seam is measuring a program no caller
+/// can run, and once the seam exists, keeping a second copy of it here would let the two drift and
+/// the table would be quoting the copy.
 ///
 /// @param b the staged batch.
 /// @param n how many points to launch.
@@ -1876,31 +2066,12 @@ BENCHMARK(BM_cpu_igrf_batch)->Unit(benchmark::kMillisecond)->UseRealTime();
 /// @complexity One dispatch over ceil(n/256) workgroups, plus 6n floats over the bus.
 /// @alloc five pooled device buffers per launch, released on return.
 bool launch_igrf_bench(const IgrfBatch& b, std::size_t n) {
-    if (!gpu::available() || !std::filesystem::exists(gpu::shader_path("irbem_igrf_f32"))) {
-        return false;
-    }
-    namespace gl = ::cheatah::gpu::linalg;
-    gl::detail::Context& c = gl::detail::ctx();
     auto& out = const_cast<std::vector<float>&>(b.out32);
-    const std::size_t vec_bytes = 3 * n * sizeof(float);
     const std::array<std::uint32_t, 2> dims{static_cast<std::uint32_t>(n), 13U};
-
-    gpu::detail::Leases lease;
-    gl::detail::Buffer* b_pos = lease.add(c.new_data_buffer(vec_bytes));
-    gl::detail::Buffer* b_out = lease.add(c.new_data_buffer(vec_bytes));
-    gl::detail::Buffer* b_cf = lease.add(c.new_buffer(b.coef.size() * sizeof(float)));
-    gl::detail::Buffer* b_nr = lease.add(c.new_buffer(b.norm.size() * sizeof(float)));
-    gl::detail::Buffer* b_dm = lease.add(c.new_buffer(dims.size() * sizeof(std::uint32_t)));
-    c.upload(b_pos, b.pos32.data(), vec_bytes);
-    c.upload(b_cf, b.coef.data(), b.coef.size() * sizeof(float));
-    c.upload(b_nr, b.norm.data(), b.norm.size() * sizeof(float));
-    c.upload(b_dm, dims.data(), dims.size() * sizeof(std::uint32_t));
-    {
-        const gpu::detail::SpvDirScope scope(gpu::shader_dir().string());
-        c.dispatch_1d("irbem_igrf_f32", lease.data(), 5, n);
-    }
-    c.download(b_out, out.data(), vec_bytes);
-    return true;
+    return gpu::launch_igrf(std::span<const float>(b.pos32.data(), 3 * n),
+                            std::span<const float>(b.coef), std::span<const float>(b.norm),
+                            std::span<const std::uint32_t>(dims),
+                            std::span<float>(out.data(), 3 * n));
 }
 #endif
 
@@ -1944,7 +2115,7 @@ struct Routine {
 };
 
 /// Every routine the table reports, in the order it reports them.
-constexpr std::array<Routine, 45> kRoutines{{
+constexpr std::array<Routine, 47> kRoutines{{
     {"datetime: julian_day_number", "BM_cpu_julian_day_number", nullptr, "BM_irbem_julday", nullptr},
     {"datetime: calendar_date", "BM_cpu_calendar_date", nullptr, "BM_irbem_caldat", nullptr},
     {"datetime: day_of_year", "BM_cpu_day_of_year", nullptr, "BM_irbem_get_doy", nullptr},
@@ -2002,16 +2173,21 @@ constexpr std::array<Routine, 45> kRoutines{{
      "BM_irbem_get_field_dipole", "irbem_dipole_f32"},
 
     {"lstar: trace_invariant (one line)", "BM_cpu_trace_invariant", nullptr,
-     "BM_irbem_make_lstar_trace", "irbem_trace_i_f32"},
+     "BM_irbem_make_lstar_pitch", "irbem_trace_i_f32"},
     {"lstar: trace batch of 65536", "BM_cpu_trace_batch/65536/real_time",
-     "BM_gpu_trace_batch/65536/real_time", "BM_irbem_make_lstar_trace", "irbem_trace_i_f32"},
+     "BM_gpu_trace_batch/65536/real_time", "BM_irbem_make_lstar_pitch", "irbem_trace_i_f32"},
+    {"T89: t89_field, Kp = 0 (quiet)", "BM_cpu_t89_field/0", nullptr,
+     "BM_irbem_get_field_t89/0", nullptr},
+    {"T89: t89_field, Kp = 9- (extreme storm)", "BM_cpu_t89_field/90", nullptr,
+     "BM_irbem_get_field_t89/90", nullptr},
+
     {"lstar: mcilwain_l (Hilton)", "BM_cpu_mcilwain_l", nullptr, nullptr, nullptr},
     {"lstar: dipole_moment", "BM_cpu_dipole_moment", nullptr, nullptr, nullptr},
 }};
 
 /// The extra routines that exist but do not head a table row of their own, kept here so the
 /// manifest is a complete listing of what the binary measures rather than a filtered one.
-constexpr std::array<Routine, 5> kExtraRoutines{{
+constexpr std::array<Routine, 14> kExtraRoutines{{
     {"igrf: evaluate, degree 10, GEO", "BM_cpu_igrf_evaluate_deg10", nullptr, nullptr,
      "irbem_igrf_f32"},
     {"igrf: evaluate, degree 13, spherical", "BM_cpu_igrf_evaluate_deg13_sph", nullptr, nullptr,
@@ -2020,7 +2196,29 @@ constexpr std::array<Routine, 5> kExtraRoutines{{
      "irbem_dipole_f32"},
     {"helio: GSE->HEE, position (cold)", "BM_cpu_gse_to_hee_cold", nullptr, "BM_irbem_gse2hee",
      nullptr},
-    {"lstar: L* drift shell (NOT PORTED)", "-", nullptr, "BM_irbem_make_lstar_full", nullptr},
+    {"T89: t89_field, Kp = 1.0", "BM_cpu_t89_field/10", nullptr,
+     "BM_irbem_get_field_t89/10", nullptr},
+    {"T89: t89_field, Kp = 2.0", "BM_cpu_t89_field/20", nullptr,
+     "BM_irbem_get_field_t89/20", nullptr},
+    {"T89: t89_field, Kp = 3.0", "BM_cpu_t89_field/30", nullptr,
+     "BM_irbem_get_field_t89/30", nullptr},
+    {"T89: t89_field, Kp = 4.0", "BM_cpu_t89_field/40", nullptr,
+     "BM_irbem_get_field_t89/40", nullptr},
+    {"T89: t89_field, Kp = 5.0", "BM_cpu_t89_field/50", nullptr,
+     "BM_irbem_get_field_t89/50", nullptr},
+    {"T89: t89_field, Kp = 6.0", "BM_cpu_t89_field/60", nullptr,
+     "BM_irbem_get_field_t89/60", nullptr},
+    {"T89: t89_field, Kp = 7.0", "BM_cpu_t89_field/70", nullptr,
+     "BM_irbem_get_field_t89/70", nullptr},
+    {"T89: t89_field, Kp = 8.0", "BM_cpu_t89_field/80", nullptr,
+     "BM_irbem_get_field_t89/80", nullptr},
+    {"lstar: trace at alpha = 90 deg only (locally mirroring)", "-", nullptr,
+     "BM_irbem_make_lstar_trace", nullptr},
+    // `driftshell.hpp::make_lstar` landed while this suite was being written, so the row no longer
+    // says NOT PORTED — but nothing here times it yet, and an empty CPU cell beside IRBEM's cost is
+    // the honest rendering of "ported, not yet measured". Owed: a CPU (and device) lane for it.
+    {"lstar: L* drift shell (ported; NOT YET BENCHMARKED here)", "-", nullptr,
+     "BM_irbem_make_lstar_full", nullptr},
 }};
 
 /// Whether `irbem.slang` defines @p entry as a compute entry point.
@@ -2039,32 +2237,77 @@ bool slang_defines(std::string_view entry) {
     return buffer.str().find("void " + std::string(entry) + "(") != std::string::npos;
 }
 
-/// What the "on GPU?" column says for a routine, DERIVED from `dispatch.hpp`'s registry and from
-/// `irbem.slang` itself.
+/// Where `dispatch.hpp` lives, derived from the header that declares the kernels rather than from
+/// the working directory — the same trick @ref gpu::shader_source_path plays, for the same reason.
+/// @return the path to `gpu/dispatch.hpp`.
+/// @complexity O(1).
+/// @alloc two short-lived paths, one of them returned.
+std::filesystem::path dispatch_header_path() {
+    return gpu::shader_source_path().parent_path() / "dispatch.hpp";
+}
+
+/// The named launcher in `dispatch.hpp` that dispatches @p entry, if one exists.
+///
+/// This used to be a hand-written rule — "four bindings means `dispatch_batch`, and
+/// `irbem_trace_i_f32` means `launch_trace`, and everything else is unreachable" — which is not a
+/// derivation at all: it is a second list, in a second file, that goes stale the moment somebody
+/// writes a launcher. It did. `launch_igrf` was added to the seam and this column went on
+/// publishing "registered, NO LAUNCHER" about a kernel the seam had learned to launch. So the
+/// answer is now READ from the seam: find `dispatch_1d("<entry>"` and name the enclosing
+/// `launch_*` function.
+///
+/// @param entry the Slang entry-point name.
+/// @return the launcher's identifier, or an empty string when no launcher names @p entry.
+/// @complexity O(size of dispatch.hpp), once per query.
+/// @alloc the file contents and the returned name.
+std::string launcher_for(std::string_view entry) {
+    std::ifstream f(dispatch_header_path());
+    if (!f) return {};
+    std::stringstream buffer;
+    buffer << f.rdbuf();
+    const std::string src = buffer.str();
+    const std::string needle = "dispatch_1d(\"" + std::string(entry) + "\"";
+    const std::size_t at = src.find(needle);
+    if (at == std::string::npos) return {};
+    // Walk back to the nearest `launch_…(` that opens before the dispatch: that is the function
+    // the call sits in, and its name is what a caller would write.
+    const std::size_t decl = src.rfind("launch_", at);
+    if (decl == std::string::npos) return {};
+    std::size_t end = decl;
+    while (end < src.size() && (std::isalnum(static_cast<unsigned char>(src[end])) != 0 ||
+                                src[end] == '_')) {
+        ++end;
+    }
+    return src.substr(decl, end - decl);
+}
+
+/// What the "on GPU?" column says for a routine, DERIVED from `dispatch.hpp`'s registry, from
+/// `dispatch.hpp`'s own launchers, and from `irbem.slang` itself.
 ///
 /// The four answers are the four real states, and the third one is the whole reason this column
 /// exists: a kernel can be written, compiled and even measured in isolation while remaining
 /// unreachable through the seam every caller goes through, and that is a porting gap, not a
-/// success. `dispatch_batch` binds exactly four buffers — pos, out, params, dims — so a registry
-/// row declaring more than four is a kernel the seam cannot launch yet either.
+/// success. `dispatch_batch` binds exactly four buffers — pos, out, params, dims — so a four-slot
+/// registry row is reachable through the generic seam; anything wider needs a launcher of its own,
+/// and @ref launcher_for goes and looks for one instead of assuming.
 /// @param r the routine.
 /// @return the column text.
-/// @complexity O(registry size) plus one read of `irbem.slang` when the kernel is unregistered.
+/// @complexity O(registry size) plus one read of `dispatch.hpp`, and of `irbem.slang` when the
+///             kernel is unregistered.
 /// @alloc the returned string.
 std::string gpu_status(const Routine& r) {
     if (r.kernel == nullptr) return "no - host only";
     for (const gpu::KernelInfo& k : gpu::registered_kernels) {
         if (std::string_view(k.name) != std::string_view(r.kernel)) continue;
-        // Four bindings is what `dispatch_batch` can express; the tracer carries its own
-        // `launch_trace` for its seven. Anything else is registered and compiled but has no host
-        // side that reaches it, which is a porting gap and is reported as one.
+        // Four bindings is what `dispatch_batch` can express generically; a wider kernel is
+        // reachable only if somebody wrote it a launcher, so go and read whether somebody did.
         if (k.bindings == 4) return std::string("yes - ") + r.kernel + " via dispatch_batch";
-        if (std::string_view(k.name) == "irbem_trace_i_f32") {
-            return std::string("yes - ") + r.kernel + " via launch_trace";
+        if (const std::string via = launcher_for(k.name); !via.empty()) {
+            return std::string("yes - ") + r.kernel + " via " + via;
         }
         return std::string("registered, NO LAUNCHER - ") + r.kernel + " binds " +
                std::to_string(k.bindings) +
-               " buffers; dispatch_batch expresses 4 and launch_trace is the tracer's own";
+               " buffers; dispatch_batch expresses 4 and no launcher in dispatch.hpp names it";
     }
     if (slang_defines(r.kernel)) {
         return std::string("kernel only - ") + r.kernel +
@@ -2092,8 +2335,12 @@ std::string gpu_status(const Routine& r) {
 /// and every verdict is identical.
 constexpr double kFlopsPerHarmonicSlot = 5.0;
 
-/// Coefficient slots in a degree-13 expansion: `(N+1)(N+2)/2`, of which `N(N+2)` carry a
-/// coefficient. The triangular count is what the kernel actually loops over.
+/// Coefficient slots in a degree-13 expansion: the `(n, m)` pairs with `0 ≤ m ≤ n ≤ 13`, which is
+/// `(N+1)(N+2)/2 = 105`. That is the triangle the kernel actually loops over. It carries
+/// `N(N+2) = 195` real coefficients — each slot holds a `g` and, for `m > 0`, an `h`, and the term
+/// model charges both together — and one of its slots, `n = 0`, is not part of the expansion at
+/// all, so this is a ~1% overcount of the loop trip count and is deliberately not corrected: the
+/// table's argument is the ratio between rows, and the same constant sits in the trace row too.
 constexpr double kIgrfSlots = 105.0;
 
 /// Flops in one IGRF-14 evaluation at degree 13, under @ref kFlopsPerHarmonicSlot.
@@ -2181,7 +2428,7 @@ void print_intensity() {
 
 /// Print the manifest, one tab-separated row per routine, and exit.
 ///
-/// Consumed by `scripts/bench_table.sh`, which joins it against the JSON this same binary emits.
+/// Consumed by `scripts/bench_run.sh`, which joins it against the JSON this same binary emits.
 /// Nothing in the output is a measurement — every number in the table comes from the JSON — and
 /// nothing in it is hand-maintained prose about the device: @ref gpu_status derives that.
 /// @complexity O(routines), plus one read of `irbem.slang`.
@@ -2197,15 +2444,162 @@ void print_manifest() {
     for (const Routine& r : kExtraRoutines) emit(r, "no");
 }
 
+// ---------------------------------------------------------------------------------------------
+// --verify — a fast lane that computes the WRONG answer is not a fast lane
+// ---------------------------------------------------------------------------------------------
+
+/// One lane comparison: what was compared, over how many points, and how far apart the lanes got.
+struct Verification {
+    const char* lane;      ///< The device lane's name.
+    const char* quantity;  ///< The quantity compared.
+    std::size_t n;         ///< How many values were compared.
+    double max_rel;        ///< The largest relative deviation seen.
+    double budget;         ///< The budget from `docs/ERROR_BUDGET.md` §5.
+};
+
+/// The relative deviation of @p dev from @p host, guarded against a zero reference.
+/// @param host the fp64 reference value. @param dev the fp32 device value.
+/// @return `|dev − host| / max(|host|, tiny)`.
+/// @complexity O(1).
+/// @alloc none.
+double rel_dev(double host, double dev) {
+    const double d = std::abs(dev - host);
+    const double s = std::abs(host);
+    return s > 1e-30 ? d / s : d;
+}
+
+/// Check every device lane the table quotes against its own host lane, and report the spread.
+///
+/// The suite measured three device lanes for a long time without ever asking whether any of them
+/// computed the right answer. A benchmark cannot: `launch_igrf` returning `true` says a dispatch
+/// was submitted, not that the coefficient buffer was packed the way the kernel unpacks it, and a
+/// kernel that reads the normalisation table at the wrong stride is exactly as fast as one that
+/// reads it correctly. So the speedups in `BENCHMARKS.md` were, strictly, throughput claims about
+/// an unverified computation. This mode closes that: it is the reason a published ratio may be
+/// quoted at all, and `bench_run.sh check` runs it before it grades a single row.
+///
+/// Budgets are `docs/ERROR_BUDGET.md` §5 — `Blocal` 1e-6 relative, `Bmin` 1e-5, `XJ` 1e-4. The
+/// device lanes are fp32 and the host lanes fp64, so these are fp32-limited agreements between two
+/// implementations, not accuracies against the physics.
+///
+/// @return 0 when every lane is inside its budget, 1 otherwise; 0 with a note when there is no
+///         device, because "no GPU here" is not a failure of the code.
+/// @complexity O(kBatch + kIgrfBatch + kVerifyLines × steps) on each of two lanes.
+/// @alloc the comparison buffers, once.
+int verify_device_lanes() {
+#ifndef CHEATAH_SPACE_IRBEM_LSTAR_GPU
+    std::printf("# no device lane in this build (no cheatah-gpu-linalg on the include path)\n");
+    return 0;
+#else
+    if (!gpu::available()) {
+        std::printf("# no device: %s\n", gpu::unavailable_reason().c_str());
+        return 0;
+    }
+    std::vector<Verification> rows;
+
+    // --- irbem_dipole_f32: the fp32 host twin against the kernel, component by component.
+    {
+        const Inputs& in = inputs();
+        const auto g10 = static_cast<float>(in.dipole.g10);
+        std::vector<float> host(3 * kBatch);
+        std::vector<float> dev(3 * kBatch);
+        gpu::dipole_field_host(std::span<const float>(in.batch_pos), std::span<float>(host), g10);
+        gpu::dipole_field_gpu(std::span<const float>(in.batch_pos), std::span<float>(dev), g10);
+        double worst = 0.0;
+        for (std::size_t i = 0; i < kBatch; ++i) {
+            // Compare the magnitude, not a component: a component near a zero crossing has no
+            // relative scale of its own and would report a meaningless ratio.
+            const auto mag = [](const std::vector<float>& v, std::size_t k) {
+                return std::sqrt((double(v[3 * k]) * v[3 * k]) +
+                                 (double(v[(3 * k) + 1]) * v[(3 * k) + 1]) +
+                                 (double(v[(3 * k) + 2]) * v[(3 * k) + 2]));
+            };
+            worst = std::max(worst, rel_dev(mag(host, i), mag(dev, i)));
+        }
+        rows.push_back({"irbem_dipole_f32", "|B| vs the fp32 host twin", kBatch, worst, 1e-6});
+    }
+
+    // --- irbem_igrf_f32: the kernel against igrf.hpp's own fp64 evaluate.
+    {
+        const Inputs& in = inputs();
+        const IgrfBatch& b = igrf_batch();
+        if (launch_igrf_bench(b, kIgrfBatch)) {
+            double worst = 0.0;
+            for (std::size_t i = 0; i < kIgrfBatch; ++i) {
+                const FieldVector<Frame::GEO> h = in.igrf13->evaluate(b.geo64[i]);
+                const double hm = std::sqrt((h.v[0] * h.v[0]) + (h.v[1] * h.v[1]) +
+                                            (h.v[2] * h.v[2]));
+                const double dm =
+                    std::sqrt((double(b.out32[3 * i]) * b.out32[3 * i]) +
+                              (double(b.out32[(3 * i) + 1]) * b.out32[(3 * i) + 1]) +
+                              (double(b.out32[(3 * i) + 2]) * b.out32[(3 * i) + 2]));
+                worst = std::max(worst, rel_dev(hm, dm));
+            }
+            rows.push_back({"irbem_igrf_f32", "|B| vs the fp64 host lane", kIgrfBatch, worst, 1e-6});
+        }
+    }
+
+    // --- irbem_trace_i_f32: the whole RK4 chain, compared on the invariant it exists to produce.
+    {
+        constexpr std::size_t kVerifyLines = 4096;
+        const Inputs& in = inputs();
+        const TraceInputs& tr = trace_inputs();
+        std::vector<FieldLine> dev(kVerifyLines);
+        std::vector<Status> st(kVerifyLines);
+        const Result<bool> ran = detail::trace_batch_on_device(
+            *in.igrf13, std::span<const Position<Frame::GEO>>(tr.starts.data(), kVerifyLines),
+            std::span<const double>(tr.pitch_deg.data(), kVerifyLines),
+            std::span<FieldLine>(dev.data(), kVerifyLines),
+            std::span<Status>(st.data(), kVerifyLines), TraceOptions{});
+        if (ran.value) {
+            double worst_i = 0.0;
+            double worst_b = 0.0;
+            std::size_t compared = 0;
+            for (std::size_t i = 0; i < kVerifyLines; ++i) {
+                if (st[i] != Status::Ok) continue;
+                const Result<FieldLine> h =
+                    trace_invariant(*in.igrf13, tr.starts[i], tr.pitch_deg[i]);
+                if (h.status != Status::Ok) continue;
+                worst_i = std::max(worst_i, rel_dev(h.value.invariant_i, dev[i].invariant_i));
+                worst_b = std::max(worst_b, rel_dev(h.value.b_min, dev[i].b_min));
+                ++compared;
+            }
+            rows.push_back({"irbem_trace_i_f32", "I vs the fp64 host lane", compared, worst_i,
+                            1e-4});
+            // `Bmin` is a root-find on top of B, so §5 gives it 1e-5 rather than `Blocal`'s
+            // 1e-6. The measured deviation comes in an order better than that; the gate still
+            // quotes the documented budget rather than a tighter one invented here.
+            rows.push_back({"irbem_trace_i_f32", "Bmin vs the fp64 host lane", compared, worst_b,
+                            1e-5});
+        }
+    }
+
+    std::printf("# lane\tquantity\tn\tmax_rel_dev\tbudget\tverdict\n");
+    int bad = 0;
+    for (const Verification& v : rows) {
+        const bool ok = v.max_rel <= v.budget;
+        if (!ok) ++bad;
+        std::printf("%s\t%s\t%zu\t%.3g\t%.3g\t%s\n", v.lane, v.quantity, v.n, v.max_rel, v.budget,
+                    ok ? "inside budget" : "OUTSIDE BUDGET");
+    }
+    if (rows.empty()) {
+        std::printf("# no device lane ran — nothing verified\n");
+        return 1;
+    }
+    return bad == 0 ? 0 : 1;
+#endif
+}
+
 }  // namespace
 
 /**
  * The suite's entry point.
  *
  * `--manifest` prints @ref print_manifest and exits, `--intensity` prints @ref print_intensity and
- * exits; everything else is Google Benchmark's own argument handling. Both are modes of this
- * binary rather than separate ones, so the routine list, the intensity model and the code that
- * measures them can never be built from different sources.
+ * exits, `--verify` runs @ref verify_device_lanes and exits with its status; everything else is
+ * Google Benchmark's own argument handling. All three are modes of this binary rather than separate
+ * ones, so the routine list, the intensity model, the correctness check and the code that measures
+ * them can never be built from different sources.
  *
  * @param argc the argument count. @param argv the arguments.
  * @return 0 on success, 1 when Google Benchmark rejects its arguments.
@@ -2222,6 +2616,7 @@ int main(int argc, char** argv) {
             print_intensity();
             return 0;
         }
+        if (std::strcmp(argv[i], "--verify") == 0) return verify_device_lanes();
     }
     benchmark::Initialize(&argc, argv);
     if (benchmark::ReportUnrecognizedArguments(argc, argv)) return 1;

@@ -627,7 +627,12 @@ TEST(IrbemStatus, T89KpBinsFollowThePublishedIntervals) {
         double kp10;
         int bin;
     };
-    constexpr std::array<KpCase, 28> cases{{
+    // `std::to_array`, NOT `std::array<KpCase, N>` with a hand-written N: this list had 27 entries
+    // declared as 28, so the last element was value-initialized to {0, 0} and quietly asserted
+    // `t89_kp_bin(0) == 0` — a case nobody wrote, testing a convention nobody chose, against an
+    // implementation that correctly returns the paper's 1-based `iopt`. Deducing the size makes
+    // that class of phantom case impossible rather than merely unlikely.
+    constexpr auto cases = std::to_array<KpCase>({
         {0, 1},  {3, 1},                     // 0, 0+
         {7, 2},  {10, 2}, {13, 2},           // 1-, 1, 1+
         {17, 3}, {20, 3}, {23, 3},           // 2-, 2, 2+
@@ -636,7 +641,8 @@ TEST(IrbemStatus, T89KpBinsFollowThePublishedIntervals) {
         {47, 6}, {50, 6}, {53, 6},           // 5-, 5, 5+
         {57, 7}, {60, 7}, {63, 7}, {70, 7},  // 6- and up
         {73, 7}, {77, 7}, {80, 7}, {83, 7}, {87, 7}, {90, 7},
-    }};
+    });
+    static_assert(cases.size() == 27, "one case per representable Kp from 0 through 9");
     for (const KpCase& c : cases) {
         EXPECT_EQ(ib::t89_kp_bin(c.kp10), c.bin) << "Kp x 10 = " << c.kp10;
     }

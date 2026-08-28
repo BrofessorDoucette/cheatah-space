@@ -12,9 +12,13 @@
  * trace that returns `posit` writes four doubles per step per line — position and `|B|` — up to
  * IRBEM's `posit(3,3000)`. A single L=4 line at the module's default step is ~120 samples, ~3.8 kB;
  * the same line through @ref trace_invariant returns 48 bytes. The arithmetic per step is
- * unchanged, so the arithmetic intensity falls by two to three orders of magnitude and the
- * routines land on the *other* side of the roofline: they are **bandwidth-bound**, and the
- * measured crossover reflects it. See @ref trace_field_line_batch for the number.
+ * unchanged, so the arithmetic intensity falls by two orders of magnitude — ~9 400 flops/byte to
+ * ~125 — and the routines land on the *other* side of the roofline. What that costs is MEASURED in
+ * @ref trace_field_line_toward_earth_batch, and it is not where the guess said it would be: the
+ * device crossover came out at 256 lines rather than higher than the tracer's 512, because a
+ * crossover is a ratio and this routine's HOST lane is 2.6× dearer per line too. The bandwidth
+ * shows up in the CEILING instead — the invariant tracer's speedup is still climbing at 65 536
+ * lines, this one flattens in the low twenties and goes noisy above 4 096.
  *
  * Two consequences are structural, not stylistic:
  *
@@ -49,12 +53,15 @@
  *
  *  - `Bmin` and the magnetic equator come from a **parabolic fit in arc length** through the three
  *    samples bracketing the minimum. The coarse minimum is wrong in the value at O(ds²) and in the
- *    position at O(ds) — measured against the oracle on an L=4 line, the coarse sample sits
- *    5.5 × 10⁻⁶ relative above `Bmin` and 4.4 × 10⁻³ R_E away from it, which is 100× the
- *    difference the fit leaves.
+ *    position at O(ds): on an L=4 line the coarse sample sits 5.5 × 10⁻⁶ relative above the
+ *    oracle's `Bmin` and 4.4 × 10⁻³ R_E away from where it is. Deleting the fit and re-running the
+ *    differential sweep moves the equator position from 4.6 × 10⁻⁵ R_E of the oracle to
+ *    1.03 × 10⁻² — **224× worse**, measured, which is the answer to "is this refinement earning
+ *    its lines".
  *  - The mirror point, the foot point and the `R0` end caps come from **regula falsi inside the
  *    last step** — on `|B|`, on geodetic altitude and on radius respectively — evaluating the true
- *    field at each trial rather than interpolating between the bracketing samples.
+ *    field at each trial rather than interpolating between the bracketing samples. Four Illinois
+ *    iterations reach an exact zero on the `R0` cap; the shipped setting is eight.
  *
  * @note @ref find_foot_point terminates on GEODETIC altitude, not radius, so it converts inside the
  *       step loop through `coords_geodetic.hpp`. That is not a detail: the WGS-84 ellipsoid is
@@ -80,6 +87,7 @@
 #include <cstdint>
 
 #include <span>
+#include <vector>
 
 #include "coords_geodetic.hpp"
 #include "frames.hpp"
@@ -170,9 +178,18 @@ struct TracedLine {
     std::size_t start_index = 0;
     /// The index of the sample nearest @ref equator — the parabola's centre, not its vertex.
     std::size_t equator_index = 0;
-    /// Whether the path ran out of caller-supplied room before the line closed. When true the
-    /// scalars describe the truncated path and not the field line, which is why the status is
+    /// Whether the path ran out of caller-supplied room before the line closed; the status is then
     /// @ref Status::NotConverged rather than @ref Status::Ok.
+    ///
+    /// There are TWO shapes of truncation and they leave different amounts behind, so a caller
+    /// must not read the scalars without checking @ref start_index:
+    ///
+    ///  - The BACKWARD half alone filled the buffer. The trace returns before the input point is
+    ///    even stored, so @ref start_index is 0 and @ref b_min, @ref invariant_i and
+    ///    @ref mcilwain_l are all **exactly zero** — nothing was integrated and nothing is
+    ///    reported. Reading them as a short field line would be reading zeros.
+    ///  - The backward half FITTED and the forward one did not. Then the quadrature ran over the
+    ///    partial line and the scalars describe THAT, not the field line.
     bool truncated = false;
 };
 
@@ -209,18 +226,35 @@ struct FootPoint {
 
 namespace detail {
 
+/// The largest fraction of the current geocentric radius one RK4 step may cover.
+///
+/// `dipole_l` is `r / cos²(latitude)`, so the L-proportional step blows up toward the poles: at
+/// |latitude| 77° and r = 2 R_E it is 0.79 R_E, and a single step of that length can land inside
+/// the Earth or on the far side of it, at which point every subsequent quantity is fiction. This
+/// binds only above |latitude| ≈ 68.5° (where `1/cos²lat > 8/steps_per_l` at the default 50) and
+/// leaves every step in the belts untouched.
+inline constexpr double max_step_fraction_of_radius = 1.0 / 8.0;
+
 /// The step length a trace from @p start uses, in Earth radii.
 ///
+/// `L/steps_per_l` — `lstar.hpp`'s rule, so the two tracers walk the same grid — with the polar
+/// clamp above. **The clamp is the one place these routines and `lstar.hpp` can disagree about the
+/// grid**, and only above |latitude| ≈ 68.5°, where the unclamped step would be longer than an
+/// eighth of the way to the centre of the Earth.
+///
 /// @param start the starting position, GEO, Earth radii.
-/// @param opt the options; @ref PathTraceOptions::step_size wins when positive.
+/// @param opt the options; @ref PathTraceOptions::step_size wins when positive, unclamped, because
+///        a caller naming an absolute step has already decided.
 /// @return the unsigned step length; never zero, so a trace cannot stall.
 /// @complexity O(1). @alloc none.
 /// @test IrbemTraceApi.StepSizeFollowsTheDipoleLUnlessOverridden
+/// @test IrbemTraceApi.StepSizeIsClampedNearThePoles
 [[nodiscard]] inline double path_step(const Position<Frame::GEO>& start,
                                       const PathTraceOptions& opt) {
     if (opt.step_size > 0.0) return opt.step_size;
     const double per_l = opt.steps_per_l > 0.0 ? opt.steps_per_l : 50.0;
-    return dipole_l(start) / per_l;
+    return std::min(dipole_l(start) / per_l,
+                    fixarray::norm(start.v) * max_step_fraction_of_radius);
 }
 
 /// The signed step that walks toward INCREASING `|B|` from @p p — the direction of the near mirror
@@ -275,9 +309,21 @@ struct RefinedPoint {
 /// O(ds²) — 6 × 10⁻³ R_E at the module's default step, against the ~10⁻¹⁰ this leaves.
 ///
 /// The Illinois modification is not decoration: `|B|` along a field line is strongly convex near a
-/// mirror point, so plain regula falsi retains one endpoint for every iteration and converges
-/// linearly with a ratio near 1. Halving the stale endpoint's value restores superlinearity, which
-/// is what lets eight iterations be enough.
+/// mirror point, so plain regula falsi can retain one endpoint for every iteration and converge
+/// linearly with a ratio near 1. Halving the STALE endpoint's value restores superlinearity, which
+/// is what lets eight iterations be enough — measured residuals are 1e-13 R_E on the `R0` caps and
+/// 3e-11 nT on a mirror field.
+///
+/// The halving fires only on a REPEATED retention, which is the whole of Illinois and was worth
+/// getting right: halving unconditionally penalises an endpoint that was just replaced, and the
+/// iteration degenerates into exact bisection — error halving every step, alternating in sign,
+/// stalling at ~1e-6 after eight iterations instead of reaching round-off. That was the first
+/// version of this function, and the `R0` end-cap test caught it at 2.5e-6 R_E (16 metres).
+///
+/// A trial is clamped into the bracket. It should never need to be — every caller here arrives
+/// with a genuine sign change — but an extrapolating secant on a bracket that does not contain a
+/// root walks arbitrarily far outside the step and returns a point that is not on the field line
+/// at all, which is a much worse failure than returning the step's far end.
 ///
 /// @tparam NMAX the IGRF truncation degree.
 /// @tparam F the predicate type; called as `f(Position<Frame::GEO>, fixarray::vec3d) -> double`.
@@ -298,11 +344,13 @@ template <int NMAX, class F>
                                                  double f_hi, F&& f, int iterations) {
     double lo = 0.0;
     double hi = ds;
+    int retained = 0;   // +1 when `lo` survived the last iteration, -1 when `hi` did
     RefinedPoint best{p, b, 0.0};
     for (int i = 0; i < iterations; ++i) {
         const double denom = f_hi - f_lo;
         if (!(std::abs(denom) > 0.0)) break;
-        const double t = lo - (f_lo * (hi - lo) / denom);
+        const double raw = lo - (f_lo * (hi - lo) / denom);
+        const double t = std::clamp(raw, std::min(lo, hi), std::max(lo, hi));
         fixarray::vec3d b_t{};
         const Position<Frame::GEO> q = rk4_step(model, p, b, t, b_t);
         const double f_t = f(q, b_t);
@@ -311,11 +359,13 @@ template <int NMAX, class F>
         if ((f_t < 0.0) == (f_lo < 0.0)) {
             lo = t;
             f_lo = f_t;
-            f_hi *= 0.5;   // Illinois: the retained endpoint's weight decays instead of stalling
+            if (retained > 0) f_hi *= 0.5;   // Illinois: only a STALE endpoint's weight decays
+            retained = 1;
         } else {
             hi = t;
             f_hi = f_t;
-            f_lo *= 0.5;
+            if (retained < 0) f_lo *= 0.5;
+            retained = -1;
         }
     }
     return best;
@@ -358,11 +408,15 @@ template <int NMAX, class F>
  * through the three samples that bracket the minimum and takes a partial RK4 step to its vertex.
  * The coarse sample is not the answer and returning it would be a silent O(ds) error in the
  * position: measured on an L≈4 line at the default step, the coarse minimum sits 5.5 × 10⁻⁶
- * relative above the oracle's `Bmin` and 4.4 × 10⁻³ R_E from its position, while the fit lands
- * within 2 × 10⁻⁷ and 3 × 10⁻⁴.
+ * relative above the oracle's `Bmin` and 4.4 × 10⁻³ R_E from its position.
  *
  * A start point that is ALREADY at the minimum is not a special case in the physics and is not one
  * here: both neighbours are probed, and if both are higher the bracket is centred on the start.
+ *
+ * Measured against the oracle over 84 start points × 4 epochs at matched IGRF: `Bmin` to
+ * 1.9 × 10⁻⁶ relative (budget 10⁻⁵) and the position to 4.6 × 10⁻⁵ R_E. The `Bmin` residual is the
+ * ORACLE's, not ours — our value at that resolution is within 10⁻⁸ of our own converged value, and
+ * the oracle sits the same 1.9 × 10⁻⁶ from it.
  *
  * @tparam NMAX the IGRF truncation degree.
  * @param model the internal field model, already built for the epoch.
@@ -375,7 +429,9 @@ template <int NMAX, class F>
  * @complexity O(steps) IGRF evaluations, ~4 per step, plus the fit; typically 50–200 steps.
  * @alloc none.
  * @test IrbemTraceApi.MagEquatorMatchesTheOracle
- * @test IrbemTraceApi.MagEquatorOfADipoleIsTheGeographicEquator
+ * @test IrbemTraceApi.MagEquatorIsTheMinimumAlongTheLine
+ * @test IrbemTraceApi.MagEquatorRefinesAStartThatIsAlreadyTheMinimum
+ * @test IrbemTraceApi.MagEquatorReportsAnOpenLine
  */
 template <int NMAX>
 [[nodiscard]] inline Result<MagneticEquator> find_magequator(const Igrf<NMAX>& model,
@@ -468,11 +524,15 @@ template <int NMAX>
  * @tparam NMAX the IGRF truncation degree.
  * @param model the internal field model, already built for the epoch.
  * @param start the starting position, GEO, Earth radii.
- * @param alpha_deg the LOCAL pitch angle at @p start, degrees, in (0, 180].
+ * @param alpha_deg the LOCAL pitch angle at @p start, degrees, strictly inside (0, 180). Both
+ *        endpoints are refused rather than clamped: a particle with no perpendicular velocity has
+ *        no mirror point at all, and `sin(180 deg)` is 1.2e-16 rather than zero in binary64, so
+ *        accepting it would return a mirror field 10^32 times `B_local` and an `OpenFieldLine`
+ *        that looks like a physics result instead of a bad argument.
  * @param opt the tracing options.
  * @return the mirror point; @ref Status::OpenFieldLine when the particle is in the loss cone or the
  *         step cap was reached, @ref Status::DomainError for a start inside `r0`, a vanishing
- *         field, or a pitch angle outside (0, 180].
+ *         field, or a pitch angle outside the open interval (0, 180).
  * @complexity O(steps) IGRF evaluations plus @ref PathTraceOptions::refine_iterations more.
  * @alloc none.
  * @test IrbemTraceApi.MirrorPointMatchesTheOracle
@@ -493,7 +553,7 @@ template <int NMAX>
     mp.position = start;
     if (!(mp.b_local > 0.0)) return {Status::DomainError, mp};
 
-    if (!(alpha_deg > 0.0) || !(alpha_deg <= 180.0)) return {Status::DomainError, mp};
+    if (!(alpha_deg > 0.0) || !(alpha_deg < 180.0)) return {Status::DomainError, mp};
     const double sin_a = std::sin(alpha_deg * (std::numbers::pi / 180.0));
     if (!(sin_a > 0.0)) return {Status::DomainError, mp};
     mp.b_mirror = mp.b_local / (sin_a * sin_a);
@@ -713,7 +773,7 @@ namespace detail {
 ///        when @p path filled first, @ref Status::OpenFieldLine when the step cap did.
 /// @return how many samples were written.
 /// @complexity O(samples) IGRF evaluations. @alloc none.
-/// @test IrbemTraceApi.HalfLineEndsOnTheReferenceSurface
+/// @test IrbemTraceApi.TraceFieldLineEndsOnTheReferenceSurfaceAtBothFeet
 template <int NMAX>
 [[nodiscard]] inline std::size_t trace_half_line(const Igrf<NMAX>& model,
                                                  const Position<Frame::GEO>& start,
@@ -783,9 +843,11 @@ template <int NMAX>
  *        needs.
  * @param opt the tracing options.
  * @return the line's scalars and the sample count. @ref Status::NotConverged when @p path filled
- *         before the line closed (@ref TracedLine::truncated is then set and the scalars describe
- *         the partial path), @ref Status::OpenFieldLine when a half hit the step cap, and
- *         @ref Status::DomainError for an empty span, a start inside `r0`, or a vanishing field.
+ *         before the line closed — @ref TracedLine::truncated is then set, and what the scalars
+ *         mean depends on WHICH half filled it, which that field's brief spells out: they are all
+ *         zero when the backward half alone exhausted the buffer. @ref Status::OpenFieldLine when
+ *         a half hit the step cap, and @ref Status::DomainError for an empty span, a start inside
+ *         `r0`, or a vanishing field.
  * @complexity O(samples) IGRF evaluations, ~4 per sample, plus O(samples) for the quadrature.
  * @alloc none — the caller's span is the only storage, and the in-place reverse that puts the two
  *        halves in order needs none.
@@ -793,6 +855,7 @@ template <int NMAX>
  * @test IrbemTraceApi.TraceFieldLineEndsOnTheReferenceSurfaceAtBothFeet
  * @test IrbemTraceApi.XjAgreesWithTheInvariantTracer
  * @test IrbemTraceApi.TraceFieldLineReportsATruncatedPath
+ * @test IrbemTraceApi.TraceFieldLineTruncatesInTheForwardHalfToo
  */
 template <int NMAX>
 [[nodiscard]] inline Result<TracedLine> trace_field_line(const Igrf<NMAX>& model,
@@ -894,6 +957,245 @@ template <int NMAX>
         return {Status::OpenFieldLine, line};
     }
     return {lm.status, line};
+}
+
+// =============================================================================================
+// The device lane — a SEPARATE kernel, because these routines are on the other side of the
+// roofline
+// =============================================================================================
+
+#ifdef CHEATAH_SPACE_IRBEM_LSTAR_GPU
+namespace detail {
+
+/// Stage one batch of fixed-step earthward traces on the device.
+///
+/// Everything epoch-dependent is computed on the HOST, once: the Gauss coefficients are
+/// interpolated to the epoch here and the Legendre normalisation is `constexpr` here, so the
+/// device never sees IGRF's 26-epoch table. That is the same split `lstar.hpp` makes and for the
+/// same reason — interpolating per thread would be N redundant copies of a calculation done once.
+///
+/// @tparam NMAX the IGRF truncation degree.
+/// @param model the internal field model. @param starts the starting positions, GEO, Earth radii.
+/// @param paths receives `starts.size() × max_points` samples, line-major.
+/// @param counts receives the sample count per line.
+/// @param statuses receives the per-line status.
+/// @param max_points the stride of @p paths, and the cap on samples per line.
+/// @param opt the tracing options; @ref PathTraceOptions::step_size must be positive.
+/// @return `Status::ParametersMissing` when the device could not be used after all, which the
+///         caller reads as "fall through to the host" rather than as an error; otherwise
+///         `Status::Ok` when every line reached the surface.
+/// @complexity One dispatch; O(lines × steps) field evaluations, concurrent, and
+///             `16 × max_points` bytes read back per line.
+/// @alloc host staging vectors for the coefficients, positions and results, plus seven pooled
+///        device buffers returned on scope exit. Per BATCH, never per line.
+/// @test IrbemTraceApiGpu.PathKernelAgreesWithTheHostLane
+/// @test IrbemTraceApiGpu.PathBatchHonoursTheStepCapOnEitherLane
+template <int NMAX>
+[[nodiscard]] inline Result<bool> trace_path_on_device(
+    const Igrf<NMAX>& model, std::span<const Position<Frame::GEO>> starts,
+    std::span<PathPoint> paths, std::span<std::uint32_t> counts, std::span<Status> statuses,
+    std::size_t max_points, const PathTraceOptions& opt) {
+
+    if (!gpu::available()) return {Status::ParametersMissing, false};
+    if (!std::filesystem::exists(gpu::shader_path("irbem_trace_path_f32"))) {
+        return {Status::ParametersMissing, false};
+    }
+
+    constexpr int kSlots = ((NMAX + 1) * (NMAX + 2)) / 2;
+    const std::size_t n = starts.size();
+
+    std::vector<float> coef(2 * kSlots, 0.0F);
+    for (int deg = 1; deg <= NMAX; ++deg) {
+        for (int m = 0; m <= deg; ++m) {
+            const std::size_t k = ((static_cast<std::size_t>(deg) * (deg + 1)) / 2) + m;
+            coef[k] = static_cast<float>(model.g(deg, m));
+            coef[kSlots + k] = static_cast<float>(model.h(deg, m));
+        }
+    }
+    constexpr auto kNorm =
+        ::cheatah::space::irbem::detail::make_legendre_normalisation<NMAX, double>();
+    std::vector<float> nrm((2 * kSlots) + NMAX + 1, 0.0F);
+    for (int k = 0; k < kSlots; ++k) {
+        nrm[static_cast<std::size_t>(k)] = static_cast<float>(kNorm.e[static_cast<std::size_t>(k)]);
+        nrm[static_cast<std::size_t>(kSlots + k)] =
+            static_cast<float>(kNorm.f[static_cast<std::size_t>(k)]);
+    }
+    for (int deg = 0; deg <= NMAX; ++deg) {
+        nrm[static_cast<std::size_t>((2 * kSlots) + deg)] =
+            static_cast<float>(kNorm.diagonal[static_cast<std::size_t>(deg)]);
+    }
+
+    std::vector<float> pos(3 * n);
+    for (std::size_t i = 0; i < n; ++i) {
+        pos[(3 * i) + 0] = static_cast<float>(starts[i].v[0]);
+        pos[(3 * i) + 1] = static_cast<float>(starts[i].v[1]);
+        pos[(3 * i) + 2] = static_cast<float>(starts[i].v[2]);
+    }
+    // ds and r0 ride in the uint dims buffer scaled by 10^6 — the ABI has no float dims slot.
+    // For `r0` that is a one-off 6 mm; for the STEP it is not, because the step is applied a few
+    // hundred times and the quantum accumulates. Measured over 1 024 lines, device against host:
+    // an exactly representable ds = 0.02 R_E ends 6.5e-6 R_E apart at the last sample, while
+    // ds = 0.0234567891 (which 1e-6 cannot hold) ends 8.5e-5 R_E — thirteen times further, and
+    // that difference is the quantisation rather than fp32. A caller who wants the two lanes to
+    // agree to fp32 alone should name a step that is a whole number of microradii.
+    //
+    // `max_steps` rides here too, and must: the host loop is bounded by it, so a kernel that
+    // ignored it would answer a capped trace differently depending on whether a device was
+    // present. Measured before it was carried: at max_steps = 10 all 1 024 lines of a batch
+    // disagreed — device 80 samples and `Ok`, host 11 and `OpenFieldLine`.
+    const std::array<std::uint32_t, 6> dims{
+        static_cast<std::uint32_t>(n), static_cast<std::uint32_t>(NMAX),
+        static_cast<std::uint32_t>(max_points),
+        static_cast<std::uint32_t>(std::llround(opt.step_size * 1.0e6)),
+        static_cast<std::uint32_t>(std::llround(opt.r0 * 1.0e6)),
+        static_cast<std::uint32_t>(std::max(0, opt.max_steps))};
+
+    std::vector<float> path_out(3 * max_points * n);
+    std::vector<float> bmag_out(max_points * n);
+    std::vector<std::uint32_t> report(2 * n);
+
+    namespace gl = gpu::detail::gl;
+    gl::detail::Context& c = gl::detail::ctx();
+    gpu::detail::Leases lease;
+    gl::detail::Buffer* b_pos = lease.add(c.new_data_buffer(pos.size() * sizeof(float)));
+    gl::detail::Buffer* b_cf = lease.add(c.new_buffer(coef.size() * sizeof(float)));
+    gl::detail::Buffer* b_nr = lease.add(c.new_buffer(nrm.size() * sizeof(float)));
+    gl::detail::Buffer* b_path = lease.add(c.new_data_buffer(path_out.size() * sizeof(float)));
+    gl::detail::Buffer* b_bmag = lease.add(c.new_data_buffer(bmag_out.size() * sizeof(float)));
+    gl::detail::Buffer* b_rep =
+        lease.add(c.new_data_buffer(report.size() * sizeof(std::uint32_t)));
+    gl::detail::Buffer* b_dm = lease.add(c.new_buffer(dims.size() * sizeof(std::uint32_t)));
+    c.upload(b_pos, pos.data(), pos.size() * sizeof(float));
+    c.upload(b_cf, coef.data(), coef.size() * sizeof(float));
+    c.upload(b_nr, nrm.data(), nrm.size() * sizeof(float));
+    c.upload(b_dm, dims.data(), dims.size() * sizeof(std::uint32_t));
+    {
+        const gpu::detail::SpvDirScope scope(gpu::shader_dir().string());
+        c.dispatch_1d("irbem_trace_path_f32", lease.data(), 7, n);
+    }
+    c.download(b_path, path_out.data(), path_out.size() * sizeof(float));
+    c.download(b_bmag, bmag_out.data(), bmag_out.size() * sizeof(float));
+    c.download(b_rep, report.data(), report.size() * sizeof(std::uint32_t));
+
+    bool all_ok = true;
+    for (std::size_t i = 0; i < n; ++i) {
+        counts[i] = report[2 * i];
+        const std::uint32_t code = report[(2 * i) + 1];
+        statuses[i] = code < status_count ? static_cast<Status>(code) : Status::DomainError;
+        all_ok = all_ok && (statuses[i] == Status::Ok);
+        for (std::uint32_t k = 0; k < counts[i]; ++k) {
+            const std::size_t src = (i * max_points) + k;
+            paths[src] = PathPoint{Position<Frame::GEO>{fixarray::vec3d{path_out[3 * src],
+                                                                       path_out[(3 * src) + 1],
+                                                                       path_out[(3 * src) + 2]}},
+                                   bmag_out[src]};
+        }
+    }
+    return {all_ok ? Status::Ok : Status::OpenFieldLine, true};
+}
+
+}  // namespace detail
+#endif  // CHEATAH_SPACE_IRBEM_LSTAR_GPU
+
+/**
+ * Trace a whole batch of field lines earthward and return every path.
+ *
+ * The batch form of @ref trace_field_line_toward_earth, and the only shape a device can
+ * accelerate: one trace is a serial RK4 chain, so no hardware makes it faster, and the parallelism
+ * is entirely ACROSS lines.
+ *
+ * **This kernel's crossover is 256 lines — MEASURED, and lower than the invariant tracer's 512
+ * rather than higher, which is not what the output shape predicts.** Both run the same RK4 chain
+ * over the same field. `irbem_trace_i_f32` returns four floats per line — ~9 400 flops per byte
+ * moved. This one returns four floats per STEP, so at ~250 steps a line it moves ~250× as many
+ * bytes for the same arithmetic: ~125 flops/byte. The transfer term the invariant tracer never
+ * pays is real, but it does not move the crossover, because a crossover is a RATIO and this
+ * routine's host lane is ~2.6× dearer per line too. Where the transfer shows up instead is the
+ * ceiling — see the two bullets under the table. That is why it is a separate kernel with a
+ * separate registry row and a separate measured threshold, and why merging the two would be a
+ * mistake in both directions.
+ *
+ * Measured on an RTX 3070 Ti against this header's own fp64 host lane (`-O3 -march=native
+ * -ffp-contract=off`), fixed step `ds = 0.02 R_E`, 512 samples of headroom per line, starts spread
+ * over L = 2…8 (`IrbemTraceApiGpu.PathKernelCrossover`):
+ *
+ * | lines | 64 | 128 | 256 | 512 | 1024 | 4096 | 16384 | 65536 |
+ * |---|---|---|---|---|---|---|---|---|
+ * | speedup | 0.33–0.39× | 0.66–0.69× | **1.05–1.15×** | 2.05–2.15× | 3.69–3.94× | 9.9–13.3× | 9.6–23.5× | 19–26.3× |
+ *
+ * against a host lane flat at 154–165 µs/line. Every cell is a range over FOUR full runs, not a
+ * best-of: below 1 024 lines the spread is a few per cent and the crossover reproduces at 256
+ * every time, while above 4 096 the same size has measured 9.6× and 23.5× on different runs. Two
+ * things in that row are worth stating plainly because they contradict the obvious expectation:
+ *
+ *  - **The crossover came out LOWER than the invariant tracer's, not higher.** Not because this
+ *    kernel is cheaper — because the HOST lane is dearer. A fixed `ds = 0.02 R_E` line is ~250
+ *    steps against the invariant tracer's ~120 at `ds = L/50`, so the host costs 154 µs/line
+ *    against 60, and the same submit floor is paid off in half the batch. A crossover is a ratio.
+ *  - **Where the bandwidth shows is the CEILING.** The invariant tracer's speedup is still
+ *    climbing at 65 536 lines (48.9×); this one flattens in the low-to-mid twenties and goes
+ *    run-to-run noisy above 4 096, where a batch stages 100 MB–1 GB of results through host
+ *    memory. The ranges above are quoted as ranges on purpose: at 16 384 lines the spread across
+ *    four runs is a factor of 2.4, so any single number from that end of the curve is a
+ *    performance claim the next run will not support.
+ *
+ * @tparam NMAX the IGRF truncation degree.
+ * @param model the internal field model, already built for the epoch.
+ * @param starts the starting positions, GEO, Earth radii.
+ * @param paths receives `starts.size() × max_points` samples, line-major: line `i`'s samples are
+ *        `paths[i*max_points .. i*max_points + counts[i])`. The caller sizes it, which at 3 000
+ *        samples and 4 096 lines is 393 MB — a number that belongs to the caller, not here.
+ * @param counts receives each line's sample count; same length as @p starts.
+ * @param statuses receives each line's status; same length as @p starts.
+ * @param opt the tracing options. @ref PathTraceOptions::step_size MUST be positive: the device
+ *        lane takes a fixed step, and an L-proportional one would make the step a per-line value
+ *        the dims buffer cannot carry.
+ * @return `true` when the device lane serviced the call — asserted by a test rather than trusted,
+ *         because a silent fallback is what makes a performance claim worthless. The status is
+ *         @ref Status::Ok when every line reached the surface, @ref Status::DomainError on a
+ *         length mismatch or a non-positive step.
+ * @complexity O(lines × steps) field evaluations; on the device those run concurrently.
+ * @alloc the device lane stages coefficients, positions and results per BATCH; the host lane
+ *        allocates nothing.
+ * @test IrbemTraceApiGpu.PathKernelAgreesWithTheHostLane
+ * @test IrbemTraceApiGpu.PathBatchUsesTheDeviceWhenOneIsAvailable
+ * @test IrbemTraceApiGpu.PathBatchHonoursTheStepCapOnEitherLane
+ */
+template <int NMAX>
+[[nodiscard]] inline Result<bool> trace_field_line_toward_earth_batch(
+    const Igrf<NMAX>& model, std::span<const Position<Frame::GEO>> starts,
+    std::span<PathPoint> paths, std::span<std::uint32_t> counts, std::span<Status> statuses,
+    const PathTraceOptions& opt) {
+
+    const std::size_t n = starts.size();
+    if (counts.size() != n || statuses.size() != n) return {Status::DomainError, false};
+    if (!(opt.step_size > 0.0)) return {Status::DomainError, false};
+    if (n == 0) return {Status::Ok, false};
+    if (paths.size() % n != 0) return {Status::DomainError, false};
+    const std::size_t max_points = paths.size() / n;
+    if (max_points == 0) return {Status::DomainError, false};
+
+#ifdef CHEATAH_SPACE_IRBEM_LSTAR_GPU
+    if (gpu::prefer_gpu("irbem_trace_path_f32", n)) {
+        if (const Result<bool> r = detail::trace_path_on_device(model, starts, paths, counts,
+                                                               statuses, max_points, opt);
+            r.status != Status::ParametersMissing) {
+            return r;
+        }
+        // The device could not be used after all (no SPIR-V, no device). Fall through to the host:
+        // a missing shader is a deployment problem, not a reason to refuse to compute.
+    }
+#endif
+
+    bool all_ok = true;
+    for (std::size_t i = 0; i < n; ++i) {
+        const Result<std::size_t> r = trace_field_line_toward_earth(
+            model, starts[i], paths.subspan(i * max_points, max_points), opt);
+        counts[i] = static_cast<std::uint32_t>(r.value);
+        statuses[i] = r.status;
+        all_ok = all_ok && (r.status == Status::Ok);
+    }
+    return {all_ok ? Status::Ok : Status::OpenFieldLine, false};
 }
 
 }  // namespace cheatah::space::irbem

@@ -56,6 +56,13 @@ add_executable(cheatah_space_tests
     irbem_coords_geodetic_test.cpp
     irbem_coords_helio_test.cpp
     irbem_igrf_test.cpp
+    irbem_status_test.cpp
+    irbem_api_test.cpp
+    irbem_field_test.cpp
+    irbem_field_hostpaths_test.cpp
+    irbem_t89_test.cpp
+    irbem_trace_api_test.cpp
+    irbem_driftshell_test.cpp
 )
 target_link_libraries(cheatah_space_tests PRIVATE
     cheatah::space
