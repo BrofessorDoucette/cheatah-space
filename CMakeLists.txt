@@ -124,7 +124,8 @@ if(CHEATAH_SPACE_GPU)
                 "irbem_trace_i_f32|KERNEL_TRACE"
         "irbem_shell_foot_f32|KERNEL_SHELL"
         "irbem_t89_f32|KERNEL_T89"
-        "irbem_trace_path_f32|KERNEL_TRACE_PATH")
+        "irbem_trace_path_f32|KERNEL_TRACE_PATH"
+        "irbem_trace_total_f32|KERNEL_TRACE_TOTAL")
 
     set(_irbem_spv_outputs "")
     foreach(_spec IN LISTS _irbem_kernels)

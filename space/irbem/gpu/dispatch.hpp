@@ -221,7 +221,7 @@ inline constexpr std::size_t always_on_device = 1;
  * and cannot drift into a registry that allocates. Adding a kernel means adding a row here AND an
  * entry point there; the completeness test fails if only one of the two happens.
  */
-inline constexpr std::array<KernelInfo, 6> registered_kernels{{
+inline constexpr std::array<KernelInfo, 7> registered_kernels{{
     // MEASURED, RTX 3070 Ti / Vulkan, best of five per size, transfers included, against this
     // header's own host lane built -O2 -ffp-contract=off (n : device Mpts/s : host Mpts/s):
     //   2^10 : 14 : 444 | 2^14 : 145 : 440 | 2^16 : 240 : 440 | 2^18 : 280 : 446
@@ -350,6 +350,21 @@ inline constexpr std::array<KernelInfo, 6> registered_kernels{{
      "field-line trace WITH its path; one thread per line, fixed step toward the Earth, writes "
      "3M+M floats per line -- bandwidth-bound, unlike irbem_trace_i_f32",
      7, 0, 256},
+
+    // The trace through the TOTAL field — IGRF plus T89 — one thread per field line, sharing
+    // igrf_eval and t89_eval with the batched kernels so each piece of physics exists in this
+    // file exactly once. The ext buffer carries one Kp bin's parameter block (selected on the
+    // HOST: a batch shares one epoch and one Kp, so a per-thread bin branch would diverge the
+    // warp for nothing) plus the epoch's gsm_from_geo rotation, column-major. EIGHT bindings —
+    // the descriptor layout's cap, and the reason Leases::capacity is 8.
+    //
+    // Crossover inherited from irbem_trace_i_f32's measured 512 as the CONSERVATIVE bound: T89
+    // adds ~400 flops to each of ~600 field evaluations for the same ~44 bytes moved, so the
+    // true crossover can only be lower. Re-measure and tighten rather than guess lower now.
+    {"irbem_trace_total_f32",
+     "field-line trace and I through IGRF+T89; one thread per FIELD LINE, whole RK4 chain "
+     "on-device; ext = one Kp bin's T89 block + gsm_from_geo",
+     8, 0, 512},
 }};
 
 /// The registry and the lease capacity must agree, checked at COMPILE time: a kernel that binds
@@ -625,12 +640,13 @@ private:
  */
 class Leases {
 public:
-    /// The most buffers any registered kernel binds — the tracer's seven. This is a HARD bound on
-    /// the ABI (the shared descriptor set layout provides eight), so it is asserted against the
-    /// registry rather than trusted: adding an eight-binding kernel must fail the build here, not
-    /// overrun this array at a customer's first dispatch. That is not hypothetical — this constant
-    /// said 4 when the seven-binding tracer landed, and the result was a segfault inside `add`.
-    static constexpr std::size_t capacity = 7;
+        /// The most buffers any registered kernel binds — the total-field tracer's EIGHT, which is
+    /// also the shared descriptor set layout's cap. There is no headroom left: a ninth binding
+    /// needs an ABI conversation, not a bump here. Asserted against the registry rather than
+    /// trusted, because this constant said 4 when the seven-binding tracer landed and the result
+    /// was a segfault inside `add` — so the capacity and its comment now change in the same edit
+    /// as the kernel that moves them, by rule.
+    static constexpr std::size_t capacity = 8;
     static_assert(capacity <= 8, "the shared descriptor set layout provides eight binding slots");
 
     Leases() = default;
@@ -750,6 +766,75 @@ inline void dispatch_batch(std::string_view kernel, std::span<const float> pos,
         c.dispatch_1d(k.name, lease.data(), k.bindings, n);
     }
     c.download(b_out, out.data(), vec_bytes);
+#endif
+}
+
+/**
+ * Launch the TOTAL-field tracer — IGRF plus T89 in one resident trace.
+ *
+ * Identical contract to @ref launch_trace, with one more upload: @p ext carries the T89 parameter
+ * block for the batch's Kp bin followed by the epoch's `gsm_from_geo` rotation, column-major —
+ * 39 floats that make the external field evaluable on the device without a host round-trip per
+ * RK4 stage. The bin is selected on the HOST because a batch shares one epoch and one Kp; a
+ * per-thread bin branch would diverge the warp for nothing.
+ *
+ * @param pos 3N floats, GEO, Earth radii. @param pitch N floats, degrees.
+ * @param coef IGRF `g` then `h`, interpolated to the epoch. @param norm the Legendre table.
+ * @param ext the 39-float external block described above.
+ * @param dims `{N, nmax, max_steps, steps_per_l x 1000}`.
+ * @param out receives 4N floats: `I`, `Bmin`, `Bmirr`, `Blocal`. @param status one word per line.
+ * @return `false` when there is no device or no compiled SPIR-V — the caller's cue for the host
+ *         lane, not an error. Genuine misuse (mismatched spans) still throws.
+ * @complexity One dispatch; O(N x steps) TOTAL-field evaluations (~900 flops each), concurrent.
+ * @alloc eight device buffers, returned to the context's size-classed pool on scope exit.
+ * @test IrbemGpu.TotalFieldTraceAgreesWithTheHostLane
+ */
+[[nodiscard]] inline bool launch_trace_total(std::span<const float> pos,
+                                             std::span<const float> pitch,
+                                             std::span<const float> coef,
+                                             std::span<const float> norm,
+                                             std::span<const float> ext,
+                                             std::span<const std::uint32_t> dims,
+                                             std::span<float> out,
+                                             std::span<std::uint32_t> status) {
+    const std::size_t n = pitch.size();
+    if (pos.size() != 3 * n || out.size() != 4 * n || status.size() != n) {
+        throw std::invalid_argument("space.irbem gpu: total-trace span lengths disagree");
+    }
+    if (n == 0) return true;
+    if (!available() || !std::filesystem::exists(shader_path("irbem_trace_total_f32"))) {
+        return false;
+    }
+
+#if CHEATAH_SPACE_IRBEM_HAVE_GPU
+    namespace gl = detail::gl;
+    gl::detail::Context& c = gl::detail::ctx();
+    detail::Leases lease;
+    // Positions and results are device-local; the tables, the ext block and dims are small,
+    // host-written once, and take the mapped path.
+    gl::detail::Buffer* b_pos = lease.add(c.new_data_buffer(pos.size() * sizeof(float)));
+    gl::detail::Buffer* b_pit = lease.add(c.new_buffer(pitch.size() * sizeof(float)));
+    gl::detail::Buffer* b_cf  = lease.add(c.new_buffer(coef.size() * sizeof(float)));
+    gl::detail::Buffer* b_nr  = lease.add(c.new_buffer(norm.size() * sizeof(float)));
+    gl::detail::Buffer* b_ex  = lease.add(c.new_buffer(ext.size() * sizeof(float)));
+    gl::detail::Buffer* b_out = lease.add(c.new_data_buffer(out.size() * sizeof(float)));
+    gl::detail::Buffer* b_st  = lease.add(c.new_data_buffer(status.size() * sizeof(std::uint32_t)));
+    gl::detail::Buffer* b_dm  = lease.add(c.new_buffer(dims.size() * sizeof(std::uint32_t)));
+    c.upload(b_pos, pos.data(), pos.size() * sizeof(float));
+    c.upload(b_pit, pitch.data(), pitch.size() * sizeof(float));
+    c.upload(b_cf, coef.data(), coef.size() * sizeof(float));
+    c.upload(b_nr, norm.data(), norm.size() * sizeof(float));
+    c.upload(b_ex, ext.data(), ext.size() * sizeof(float));
+    c.upload(b_dm, dims.data(), dims.size() * sizeof(std::uint32_t));
+    {
+        const detail::SpvDirScope scope(shader_dir().string());
+        c.dispatch_1d("irbem_trace_total_f32", lease.data(), 8, n);
+    }
+    c.download(b_out, out.data(), out.size() * sizeof(float));
+    c.download(b_st, status.data(), status.size() * sizeof(std::uint32_t));
+    return true;
+#else
+    return false;
 #endif
 }
 

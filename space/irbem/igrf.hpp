@@ -235,6 +235,23 @@ inline constexpr double radians_per_degree = 3.14159265358979323846 / 180.0;
  *           roundoff in a reduction does.
  */
 template <int NMAX = tables::igrf14_max_degree, SoundPrecision P = Exact>
+class Igrf;
+
+/// Whether @p M is an @ref Igrf instantiation — the trait the drift-shell machinery uses to decide
+/// whether its DEVICE fast-paths apply. The device kernels stage one internal model's coefficients;
+/// a composed model (internal plus external) must take the host lane for the stages that have no
+/// combined kernel yet, and `if constexpr (is_igrf_v<M>)` is what routes that at compile time
+/// instead of a runtime branch that would still have to compile the staging for types it cannot
+/// stage.
+template <class>
+inline constexpr bool is_igrf_v = false;
+/// The specialization that answers `true`: exactly the @ref Igrf instantiations, at any degree
+/// and precision policy, and nothing else — a composed model must not match, since matching is
+/// what routes a model into device paths that stage only an internal field.
+template <int NMAX, SoundPrecision P>
+inline constexpr bool is_igrf_v<Igrf<NMAX, P>> = true;
+
+template <int NMAX, SoundPrecision P>
 class Igrf {
     static_assert(NMAX >= 1 && NMAX <= tables::igrf14_max_degree,
                   "IGRF-14 publishes degrees 1 through 13");

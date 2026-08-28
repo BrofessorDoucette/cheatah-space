@@ -30,11 +30,19 @@ namespace {
 /// this instantiation would be half-tested — and llvm-cov counts it separately from every other
 /// model. One switchable model drives both halves of its own instantiation.
 struct SwitchableField {
+    /// zero: |B| = 0 everywhere (the degenerate branch). uniform: B constant (the exactly-zero
+    /// slope branch). Otherwise: an axial dipole (the north/south branches). One type reaching
+    /// EVERY branch matters beyond thoroughness: llvm-cov summarises template coverage per
+    /// instantiation, and seven instantiations each missing a different branch — none complete —
+    /// is precisely the shape its file summary mis-counts. One complete instantiation is both the
+    /// strongest test and the shape the tool aggregates correctly.
     bool zero = false;
+    bool uniform = false;
 
     [[nodiscard]] ib::FieldVector<ib::Frame::GEO> evaluate(
         const ib::Position<ib::Frame::GEO>& p) const {
         if (zero) return ib::FieldVector<ib::Frame::GEO>{fx::vec3d{0.0, 0.0, 0.0}};
+        if (uniform) return ib::FieldVector<ib::Frame::GEO>{fx::vec3d{0.0, 0.0, -30000.0}};
         // B = g10 (a/r)^3 (3 (z_hat . r_hat) r_hat - z_hat), the centred axial dipole.
         const double r2 = fx::squared_norm(p.v);
         if (r2 <= 0.0) return ib::FieldVector<ib::Frame::GEO>{fx::vec3d{0.0, 0.0, 0.0}};
@@ -103,6 +111,34 @@ TEST(IrbemFieldHostPaths, AZeroFieldHasNoHemisphere) {
     EXPECT_EQ(ib::Status::Ok, ib::hemisphere(live, {fx::vec3d{2.0, 0.0, 2.0}}, 1e-3).status);
     EXPECT_EQ(ib::Status::DomainError,
               ib::hemisphere(live, {fx::vec3d{0.0, 0.0, 0.0}}).status);
+    EXPECT_EQ(ib::Status::DomainError,
+              ib::hemisphere(live, {fx::vec3d{3.0, 0.0, 0.0}}, -1.0).status);
+
+    // ...and the exactly-zero-slope tail, through the SAME instantiation: a uniform field has
+    // |B| identical fore and aft, so neither hemisphere can be named and the defined answer is
+    // Ok, Invalid — not an arbitrary pick and not UB.
+    const SwitchableField flat{false, true};
+    const auto hu = ib::hemisphere(flat, ib::Position<ib::Frame::GEO>{fx::vec3d{3.0, 0.0, 0.0}});
+    EXPECT_EQ(ib::Status::Ok, hu.status);
+    EXPECT_EQ(ib::Hemisphere::Invalid, hu.value);
+}
+
+TEST(IrbemFieldHostPaths, AUniformFieldHasNoHemisphereEither) {
+    // The exactly-zero-slope tail of hemisphere(): |B| > 0, but the magnitude is identical fore
+    // and aft along the line, so neither hemisphere can be named. No geomagnetic model produces a
+    // perfectly uniform field, which is exactly why this needed a synthetic one — the branch is
+    // compiled into every instantiation regardless, and `slope == 0.0` is not undefined behaviour
+    // to shrug at but a defined answer: Ok, Invalid.
+    struct UniformField {
+        [[nodiscard]] ib::FieldVector<ib::Frame::GEO> evaluate(
+            const ib::Position<ib::Frame::GEO>& /*p*/) const {
+            return ib::FieldVector<ib::Frame::GEO>{fx::vec3d{0.0, 0.0, -30000.0}};
+        }
+    };
+    const UniformField uniform;
+    const auto r = ib::hemisphere(uniform, ib::Position<ib::Frame::GEO>{fx::vec3d{3.0, 0.0, 0.0}});
+    EXPECT_EQ(ib::Status::Ok, r.status);
+    EXPECT_EQ(ib::Hemisphere::Invalid, r.value);
 }
 
 TEST(IrbemFieldHostPaths, InterleavePacksPositionsForTheDeviceUpload) {
@@ -185,6 +221,15 @@ void exercise_guards_at_degree() {
     // The fp32 step path: passing 0 asks the routine to choose, which is the branch the device lane
     // takes and the one a host-only run would otherwise never compile a caller for.
     EXPECT_EQ(ib::Status::Ok, ib::hemisphere(*model, good, 0.0).status) << NMAX;
+
+    // BOTH hemisphere outcomes at this degree: |B| grows away from the magnetic equator along a
+    // field line, so north and south of it the slope has opposite signs — and each `if` of the
+    // sign test is separate compiled code per instantiation.
+    const auto hn = ib::hemisphere(*model, ib::Position<ib::Frame::GEO>{fx::vec3d{2.0, 0.0, 2.0}});
+    const auto hs = ib::hemisphere(*model, ib::Position<ib::Frame::GEO>{fx::vec3d{2.0, 0.0, -2.0}});
+    EXPECT_EQ(ib::Status::Ok, hn.status) << NMAX;
+    EXPECT_EQ(ib::Status::Ok, hs.status) << NMAX;
+    EXPECT_NE(hn.value, hs.value) << NMAX;
 
     // The trace's step cap, per degree.
     ib::TraceOptions opt;
@@ -342,12 +387,15 @@ TEST(IrbemFieldHostPaths, NonsensicalDriftShellOptionsAreRefusedPerPoint) {
     std::array<ib::DriftShell, 2> out{};
     std::array<ib::Status, 2> sts{};
 
-    for (const ib::DriftShellOptions bad : {
-             [] { ib::DriftShellOptions o; o.azimuths = 2; return o; }(),
-             [] { ib::DriftShellOptions o; o.bracket_trials = 1; return o; }(),
-             [] { ib::DriftShellOptions o; o.colatitude_step_deg = 0.0; return o; }(),
-             [] { ib::DriftShellOptions o; o.colatitude_step_deg = -1.0; return o; }(),
-         }) {
+    // Four ways to be nonsensical, built plainly rather than as immediately-invoked lambdas in a
+    // braced list — which is valid C++ that cppcheck's parser rejects outright, and a gate that
+    // cannot parse a file scans none of it.
+    std::array<ib::DriftShellOptions, 4> bads{};
+    bads[0].azimuths = 2;               // cannot enclose a contour
+    bads[1].bracket_trials = 1;         // cannot bracket a root
+    bads[2].colatitude_step_deg = 0.0;  // cannot advance the quadrature
+    bads[3].colatitude_step_deg = -1.0;
+    for (const ib::DriftShellOptions& bad : bads) {
         sts = {ib::Status::Ok, ib::Status::Ok};  // poison, so a missed write is visible
         const auto r = ib::make_lstar_batch(model, rot.value, starts, pitch, out, sts, bad);
         EXPECT_EQ(ib::Status::DomainError, r.status);

@@ -17,11 +17,17 @@
  * What is here so far — this module is being built up in order, and the file lists what
  * actually exists rather than what is planned:
  *
+ *   - `types.hpp`        the format vocabulary: data types, encodings, record types, errors.
+ *   - `bytes.hpp`        the one bounds-checked, byte-swapping reader over a file's bytes.
+ *   - `mapping.hpp`      read-only memory mapping, with the syscalls behind a testable seam.
  *   - `leapseconds.hpp`  NASA's leap-second table as exact integers, plus TAI-UTC lookup.
  *
  * The reader, writer, compression codecs, checksum and signing land on top of this.
  */
 
+#include "bytes.hpp"
 #include "leapseconds.hpp"
+#include "mapping.hpp"
+#include "types.hpp"
 
 namespace cheatah::space::cdf {}

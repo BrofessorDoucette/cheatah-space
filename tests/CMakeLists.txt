@@ -48,6 +48,8 @@ add_executable(cheatah_space_tests
     space_civil_test.cpp
     space_calendar_reform_test.cpp
     space_cdf_leapseconds_test.cpp
+    space_cdf_format_test.cpp
+    space_cdf_mapping_test.cpp
     irbem_frames_test.cpp
     irbem_policy_test.cpp
     irbem_context_test.cpp

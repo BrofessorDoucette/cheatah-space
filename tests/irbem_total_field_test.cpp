@@ -113,3 +113,76 @@ TEST(IrbemTotalField, ReportsWhenTheExternalModelDeclines) {
         EXPECT_TRUE(std::isfinite(total.evaluate(far).magnitude()));
     }
 }
+
+TEST(IrbemTotalField, LstarRunsThroughTheTotalField) {
+    // The whole drift-shell chain — reference trace, azimuth root-finds, footpoints, flux — over
+    // the SUPERPOSED field. Until driftshell.hpp was generalized this could not compile: the
+    // machinery was templated on Igrf, so no external field could reach L* and no storm could
+    // change it. The magnitude check is deliberately loose (the tight differential runs against
+    // the oracle in tools/, where the documented T89-vs-T89c model-family gap bounds it); what
+    // this asserts is that the chain RUNS, produces a physical shell parameter, and that activity
+    // ACTUALLY MOVES it.
+    const ib::Igrf<10> igrf = ib::Igrf<10>::at(2015.0).value();
+    const ib::Rotations rot = epoch_rotations(igrf);
+    const ib::Position<ib::Frame::GEO> p{fx::vec3d{5.0, 0.0, 0.0}};
+
+    const ib::TotalFieldT89<10> quiet(igrf, rot, 10.0);
+    const ib::TotalFieldT89<10> storm(igrf, rot, 60.0);
+    const auto lq = ib::make_lstar(quiet, rot, p, 90.0);
+    const auto ls = ib::make_lstar(storm, rot, p, 90.0);
+    ASSERT_EQ(ib::Status::Ok, lq.status);
+    ASSERT_EQ(ib::Status::Ok, ls.status);
+    EXPECT_GT(lq.value.lstar, 4.0);
+    EXPECT_LT(lq.value.lstar, 6.5);
+    EXPECT_NE(lq.value.lstar, ls.value.lstar)
+        << "a storm must move L*, or the external field is not reaching the drift shell";
+}
+
+TEST(IrbemTotalField, AStormTimeNightsideShellReportsNotConverged) {
+    // Under strong activity a nightside shell at high L cannot close: the drift contour runs into
+    // the stretched tail, footpoints fail on some azimuths, and the honest answer is
+    // Status::NotConverged — "a gap in the contour is not a cap". With a pure internal field this
+    // status was UNREACHABLE (dipole-like everywhere, every shell closes out to L=40 — measured),
+    // which is why covering this line had to wait for the external field rather than a mock: the
+    // first caller able to produce it is the physics itself.
+    const ib::Igrf<10> igrf = ib::Igrf<10>::at(2015.0).value();
+    const ib::Rotations rot = epoch_rotations(igrf);
+    const ib::TotalFieldT89<10> stormy(igrf, rot, 60.0);  // Kp bin 7
+
+    const auto r = ib::make_lstar(stormy, rot,
+                                  ib::Position<ib::Frame::GEO>{fx::vec3d{-9.0, 0.0, 0.0}}, 90.0);
+    EXPECT_EQ(ib::Status::NotConverged, r.status)
+        << "a midnight L=9 shell under Kp>=6 should not close in T89's stretched tail";
+    // The partial result still says how far it got — a gap is diagnostic, not a void.
+    EXPECT_GE(r.value.azimuths, 0);
+    EXPECT_LT(r.value.azimuths, 25);
+}
+
+TEST(IrbemTotalField, BatchGuardsAndDeviceRoutingHoldForTheTotalField) {
+    // The TotalField overload of trace_invariant_batch is its own compiled body: its span-length
+    // guard and its fall-through are not covered by the Igrf overload's tests, per-instantiation.
+    const ib::Igrf<10> igrf = ib::Igrf<10>::at(2015.0).value();
+    const ib::Rotations rot = epoch_rotations(igrf);
+    const ib::TotalFieldT89<10> total(igrf, rot, 30.0);
+
+    std::array<ib::Position<ib::Frame::GEO>, 2> starts{
+        ib::Position<ib::Frame::GEO>{fx::vec3d{4.0, 0.0, 0.0}},
+        ib::Position<ib::Frame::GEO>{fx::vec3d{5.0, 0.0, 0.0}}};
+    std::array<double, 1> short_pitch{45.0};  // deliberately one short
+    std::array<ib::FieldLine, 2> out{};
+    std::array<ib::Status, 2> sts{};
+    EXPECT_EQ(ib::Status::DomainError,
+              ib::trace_invariant_batch(total, starts, short_pitch, out, sts).status);
+
+    // The empty batch: a no-op answer, not a dispatch of nothing.
+    const auto empty = ib::trace_invariant_batch(total, {}, {}, {}, {});
+    EXPECT_EQ(ib::Status::Ok, empty.status);
+    EXPECT_FALSE(empty.value);
+
+    // A small valid batch — below any crossover, so the host lane, whose loop is also this
+    // overload's own code.
+    std::array<double, 2> pitch{45.0, 60.0};
+    const auto r = ib::trace_invariant_batch(total, starts, pitch, out, sts);
+    EXPECT_EQ(ib::Status::Ok, r.status);
+    EXPECT_GT(out[0].invariant_i, 0.0);
+}

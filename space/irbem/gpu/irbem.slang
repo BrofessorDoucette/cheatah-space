@@ -612,12 +612,21 @@ void irbem_shell_foot_f32(uint3 tid : SV_DispatchThreadID) {
 //                     a_T, Dy, x0)
 //           3 dims {N}
 // =============================================================================================
-#ifdef KERNEL_T89
-
-[[vk::binding(0, 0)]] StructuredBuffer<float>   t89_pos;
-[[vk::binding(1, 0)]] RWStructuredBuffer<float> t89_out;
-[[vk::binding(2, 0)]] StructuredBuffer<float>   t89_params;
-[[vk::binding(3, 0)]] StructuredBuffer<uint>    t89_dims;
+// =============================================================================================
+// Tsyganenko 1989, as a SHARED function.
+//
+// Declared outside every kernel guard and taking its parameter buffer as an argument, so both the
+// batched field kernel and the total-field tracer call one implementation of the physics —
+// the same arrangement igrf_eval has, for the same reason: the tracer evaluates the field four
+// times per RK4 step, and a second copy of eqs. (11)-(20) would be a second place for a sign or a
+// slope to be got wrong.
+//
+// The parameter layout is the one t89_field_host stages: [0]=sin(tilt) [1]=cos(tilt), [2..6] the
+// Kp bin's c1..c5, [7..20] the Chapman-Ferraro/Birkeland table, [21..29] delta_x, a_RC, D_0,
+// gamma_RC, R_C, G, a_T, D_y, x_0. One bin per buffer — the bin is selected on the HOST, because a
+// batch shares one epoch and one Kp, and a per-thread bin branch would diverge the warp for
+// nothing.
+// =============================================================================================
 
 // The parameters Tsyganenko (1989) sections 3 and 4 hold FIXED across every Kp bin. Spelled out
 // here rather than passed, because they are the same in all seven sets and a uniform read of a
@@ -637,25 +646,21 @@ static const float kT89Hinge = 16.0f;   // the (4 Re)^2 rounding the hinge in eq
 static const float kT89H1off = 16.0f;   // the 16 Re offset in h_1
 static const float kT89H1sc2 = 36.0f;   // the (6 Re)^2 scale in h_1
 
-[shader("compute")]
-[numthreads(256, 1, 1)]
-void irbem_t89_f32(uint3 tid : SV_DispatchThreadID) {
-    const uint n = t89_dims[0];
-    const uint i = tid.x;
-    if (i >= n) return;   // the grid is rounded up to a multiple of 256; the tail does nothing
+/// The T89 external field at a GSM point, in nT. See the layout note above; physics per
+/// Tsyganenko (1989), eqs. (11)-(20), with the sheet warp, thickness profiles, truncation factor,
+/// tail + ring currents, closure sheets and the Chapman-Ferraro/Birkeland envelope.
+float3 t89_eval(StructuredBuffer<float> par, float3 p_gsm) {
+    const float sps = par[0];
+    const float cps = par[1];
+    const float c1 = par[2], c2 = par[3], c3 = par[4];
+    const float c4 = par[5], c5 = par[6];
+    const float delta_x = par[21], a_rc = par[22], d0 = par[23];
+    const float gam_rc  = par[24], rc   = par[25], gg = par[26];
+    const float a_t     = par[27], d_y  = par[28], x0 = par[29];
 
-    const float x = t89_pos[3 * i + 0];
-    const float y = t89_pos[3 * i + 1];
-    const float z = t89_pos[3 * i + 2];
-
-    const float sps = t89_params[0];
-    const float cps = t89_params[1];
-    const float c1 = t89_params[2], c2 = t89_params[3], c3 = t89_params[4];
-    const float c4 = t89_params[5], c5 = t89_params[6];
-    const float delta_x = t89_params[21], a_rc = t89_params[22], d0 = t89_params[23];
-    const float gam_rc  = t89_params[24], rc   = t89_params[25], gg = t89_params[26];
-    const float a_t     = t89_params[27], d_y  = t89_params[28], x0 = t89_params[29];
-
+    const float x = p_gsm.x;
+    const float y = p_gsm.y;
+    const float z = p_gsm.z;
     const float tps = sps / cps;
 
     // ---- GSM -> SM: one rotation about y by the tilt -----------------------------------------
@@ -769,16 +774,34 @@ void irbem_t89_f32(uint3 tid : SV_DispatchThreadID) {
     // ---- eq. (20): the Chapman-Ferraro and Birkeland systems, in GSM ---------------------------
     const float env = exp(x / delta_x);
     const float z2 = z * z;
-    bx += env * (t89_params[7] * z * cps
-               + (t89_params[8] + t89_params[9] * y2 + t89_params[10] * z2) * sps);
-    by += env * (t89_params[11] * y * z * cps
-               + (t89_params[12] * y + t89_params[13] * y * y2 + t89_params[14] * y * z2) * sps);
-    bz += env * ((t89_params[15] + t89_params[16] * y2 + t89_params[17] * z2) * cps
-               + (t89_params[18] * z + t89_params[19] * z * y2 + t89_params[20] * z * z2) * sps);
+    bx += env * (par[7] * z * cps
+               + (par[8] + par[9] * y2 + par[10] * z2) * sps);
+    by += env * (par[11] * y * z * cps
+               + (par[12] * y + par[13] * y * y2 + par[14] * y * z2) * sps);
+    bz += env * ((par[15] + par[16] * y2 + par[17] * z2) * cps
+               + (par[18] * z + par[19] * z * y2 + par[20] * z * z2) * sps);
 
-    t89_out[3 * i + 0] = bx;
-    t89_out[3 * i + 1] = by;
-    t89_out[3 * i + 2] = bz;
+    return float3(bx, by, bz);
+}
+
+#ifdef KERNEL_T89
+
+[[vk::binding(0, 0)]] StructuredBuffer<float>   t89_pos;
+[[vk::binding(1, 0)]] RWStructuredBuffer<float> t89_out;
+[[vk::binding(2, 0)]] StructuredBuffer<float>   t89_params;
+[[vk::binding(3, 0)]] StructuredBuffer<uint>    t89_dims;
+
+[shader("compute")]
+[numthreads(256, 1, 1)]
+void irbem_t89_f32(uint3 tid : SV_DispatchThreadID) {
+    const uint n = t89_dims[0];
+    const uint i = tid.x;
+    if (i >= n) return;   // the grid is rounded up to a multiple of 256; the tail does nothing
+    const float3 b = t89_eval(t89_params,
+                              float3(t89_pos[3 * i + 0], t89_pos[3 * i + 1], t89_pos[3 * i + 2]));
+    t89_out[3 * i + 0] = b.x;
+    t89_out[3 * i + 1] = b.y;
+    t89_out[3 * i + 2] = b.z;
 }
 
 #endif  // KERNEL_T89
@@ -912,3 +935,173 @@ void irbem_trace_path_f32(uint3 tid : SV_DispatchThreadID) {
 }
 
 #endif  // KERNEL_TRACE_PATH
+
+// =============================================================================================
+// irbem_trace_total_f32 — the field-line trace through the TOTAL field: IGRF plus T89, one
+// thread per field line.
+//
+// This is the kernel that closes the gap the host-side TotalFieldT89 documented: until it
+// existed, a trace through internal-plus-external ran CPU-only, so every GPU speedup this module
+// quoted was for the internal field alone and the storm-time claims ran at host speed.
+//
+// STRUCTURE. The PHYSICS is shared — igrf_eval and t89_eval are the same functions the batched
+// field kernels call, so there is exactly one copy of the Legendre recursion and one copy of
+// Tsyganenko's eqs. (11)-(20) in this file. The trace CONTROL FLOW (downhill walk to the equator,
+// then both halves of the bounce path) is a copy of irbem_trace_i_f32's, because Slang gives no
+// cheap way to parameterize one loop over two field evaluators; that duplication is accepted
+// deliberately, it is the smaller risk (simple control flow, no physics), and the differential
+// test holds both kernels to the same fp64 host lane.
+//
+// FRAMES. The trace walks in GEO (the frame the invariants and footpoints are defined in); T89 is
+// defined in GSM. The GEO->GSM rotation depends only on the epoch, so the HOST builds it once and
+// uploads 9 floats; being orthogonal, its transpose — applied to the returned field vector — is
+// the inverse, so one matrix serves both directions. A FieldVector rotates with no origin shift,
+// which is why the same 9 floats can carry both the position in and the field back out.
+//
+// THE EXT BUFFER: [0..29] the T89 parameter block exactly as t89_eval reads it (one Kp bin,
+// selected on the HOST — a batch shares one epoch and one Kp, and a per-thread bin branch would
+// diverge the warp for nothing); [30..38] gsm_from_geo, column-major.
+//
+// EIGHT BINDINGS — the shared descriptor layout's cap, and the reason Leases::capacity is 8.
+//
+// bindings: 0 pos (3N, GEO, Re) | 1 pitch (N, deg) | 2 igrf coef | 3 igrf norm
+//           4 ext (39 floats, above) | 5 out (4N: I, Bmin, Bmirr, Blocal) | 6 status (N) | 7 dims
+// dims: {N, nmax, max_steps, steps_per_l_x1000}
+// =============================================================================================
+#ifdef KERNEL_TRACE_TOTAL
+
+static const uint kTotStatusOk = 0u;
+static const uint kTotStatusOpenFieldLine = 2u;   // matches Status::OpenFieldLine
+static const uint kTotStatusDomainError = 5u;     // matches Status::DomainError
+
+[[vk::binding(0, 0)]] StructuredBuffer<float>   tt_pos;
+[[vk::binding(1, 0)]] StructuredBuffer<float>   tt_pitch;
+[[vk::binding(2, 0)]] StructuredBuffer<float>   tt_coef;
+[[vk::binding(3, 0)]] StructuredBuffer<float>   tt_norm;
+[[vk::binding(4, 0)]] StructuredBuffer<float>   tt_ext;
+[[vk::binding(5, 0)]] RWStructuredBuffer<float> tt_out;
+[[vk::binding(6, 0)]] RWStructuredBuffer<uint>  tt_status;
+[[vk::binding(7, 0)]] StructuredBuffer<uint>    tt_dims;
+
+/// The total field at a GEO point: internal plus external, in nT.
+float3 tt_field(int nmax, int slots, float3 p_geo) {
+    const float3 b_int = igrf_eval(tt_coef, tt_norm, nmax, slots, p_geo);
+    // gsm_from_geo, column-major at ext[30..38]: column j holds R[:,j].
+    const float3 c0 = float3(tt_ext[30], tt_ext[31], tt_ext[32]);
+    const float3 c1 = float3(tt_ext[33], tt_ext[34], tt_ext[35]);
+    const float3 c2 = float3(tt_ext[36], tt_ext[37], tt_ext[38]);
+    const float3 p_gsm = c0 * p_geo.x + c1 * p_geo.y + c2 * p_geo.z;
+    const float3 b_gsm = t89_eval(tt_ext, p_gsm);
+    // The transpose IS the inverse (orthogonal): row i of R = (c0[i], c1[i], c2[i]).
+    const float3 b_ext = float3(dot(c0, b_gsm), dot(c1, b_gsm), dot(c2, b_gsm));
+    return b_int + b_ext;
+}
+
+float3 tt_unit(float3 b) {
+    const float m = length(b);
+    return m > 0.0f ? b / m : float3(0.0f, 0.0f, 0.0f);
+}
+
+/// One RK4 step along dx/ds = B/|B| of the TOTAL field, carrying the arrival field forward as the
+/// next step's k1 — one of every five evaluations removed, as in the internal-field tracer.
+float3 tt_rk4(int nmax, int slots, float3 p, float3 b_here, float ds, out float3 b_next) {
+    const float3 k1 = tt_unit(b_here);
+    const float3 k2 = tt_unit(tt_field(nmax, slots, p + k1 * (ds * 0.5f)));
+    const float3 k3 = tt_unit(tt_field(nmax, slots, p + k2 * (ds * 0.5f)));
+    const float3 k4 = tt_unit(tt_field(nmax, slots, p + k3 * ds));
+    const float3 out_p = p + (k1 + k2 * 2.0f + k3 * 2.0f + k4) * (ds / 6.0f);
+    b_next = tt_field(nmax, slots, out_p);
+    return out_p;
+}
+
+[shader("compute")]
+[numthreads(256, 1, 1)]
+void irbem_trace_total_f32(uint3 tid : SV_DispatchThreadID) {
+    const uint n_lines = tt_dims[0];
+    const int nmax = int(tt_dims[1]);
+    const int max_steps = int(tt_dims[2]);
+    const float steps_per_l = float(tt_dims[3]) * 0.001f;
+    const uint i = tid.x;
+    if (i >= n_lines) return;
+
+    const int slots = ((nmax + 1) * (nmax + 2)) / 2;
+    const float3 start = float3(tt_pos[3 * i + 0], tt_pos[3 * i + 1], tt_pos[3 * i + 2]);
+
+    tt_out[4 * i + 0] = 0.0f; tt_out[4 * i + 1] = 0.0f;
+    tt_out[4 * i + 2] = 0.0f; tt_out[4 * i + 3] = 0.0f;
+
+    const float r0 = length(start);
+    if (!(r0 > 1.0f)) { tt_status[i] = kTotStatusDomainError; return; }
+
+    float3 b = tt_field(nmax, slots, start);
+    const float b_local = length(b);
+    if (!(b_local > 0.0f)) { tt_status[i] = kTotStatusDomainError; return; }
+
+    const float sin_a = sin(tt_pitch[i] * 0.01745329251994329577f);
+    if (!(sin_a > 0.0f)) { tt_status[i] = kTotStatusDomainError; return; }
+    const float b_mirror = b_local / (sin_a * sin_a);
+
+    // Dipole L of the start, purely to size the step: ds = L/steps_per_l keeps step COUNTS uniform
+    // across lanes carrying different shells, which is what keeps a warp converged.
+    const float sin_lat = start.z / r0;
+    const float cos2 = 1.0f - sin_lat * sin_lat;
+    const float dipole_l = cos2 > 1e-12f ? r0 / cos2 : 1.0e3f;
+    const float ds_mag = dipole_l / steps_per_l;
+
+    // --- 1. downhill to the magnetic equator ---------------------------------------------------
+    float3 b_probe;
+    tt_rk4(nmax, slots, start, b, ds_mag, b_probe);
+    float ds = (length(b_probe) < b_local) ? ds_mag : -ds_mag;
+
+    float3 eq = start;
+    float3 b_eq = b;
+    float b_min = b_local;
+    bool open_line = false;
+    for (int k = 0; k < max_steps; ++k) {
+        float3 b_new;
+        const float3 q = tt_rk4(nmax, slots, eq, b_eq, ds, b_new);
+        const float bmag = length(b_new);
+        if (length(q) < 1.0f) { open_line = true; break; }
+        if (bmag >= b_min) break;
+        b_min = bmag;
+        eq = q;
+        b_eq = b_new;
+    }
+
+    // --- 2 and 3. both halves of the bounce path, from the equator outward ---------------------
+    float total = 0.0f;
+    bool closed_both = !open_line;
+    for (int half = 0; half < 2; ++half) {
+        const float dsh = (half == 0) ? ds : -ds;
+        float3 p = eq;
+        float3 bb = b_eq;
+        bool closed = false;
+        for (int k = 0; k < max_steps; ++k) {
+            const float b_prev = length(bb);
+            float3 b_new;
+            const float3 q = tt_rk4(nmax, slots, p, bb, dsh, b_new);
+            const float bmag = length(b_new);
+            if (length(q) < 1.0f) break;                 // atmosphere: the line is open
+            if (bmag >= b_mirror) {
+                if (bmag > b_prev) {
+                    const float frac = (b_mirror - b_prev) / (bmag - b_prev);
+                    total += 0.5f * sqrt(max(0.0f, 1.0f - (b_prev / b_mirror))) * frac;
+                }
+                closed = true;
+                break;
+            }
+            total += sqrt(1.0f - (bmag / b_mirror));
+            p = q;
+            bb = b_new;
+        }
+        closed_both = closed_both && closed;
+    }
+
+    tt_out[4 * i + 0] = total * abs(ds);   // I
+    tt_out[4 * i + 1] = b_min;
+    tt_out[4 * i + 2] = b_mirror;
+    tt_out[4 * i + 3] = b_local;
+    tt_status[i] = closed_both ? kTotStatusOk : kTotStatusOpenFieldLine;
+}
+
+#endif  // KERNEL_TRACE_TOTAL

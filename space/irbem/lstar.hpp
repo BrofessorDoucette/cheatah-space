@@ -312,8 +312,9 @@ template <GeoFieldModel M>
  * @complexity O(1). @alloc none.
  * @test IrbemLstar.DipoleMomentTracksTheEpoch
  */
-template <int NMAX>
-[[nodiscard]] inline double dipole_moment(const Igrf<NMAX>& model) {
+template <class M>
+    requires requires(const M& m) { { m.g(1, 0) } -> std::convertible_to<double>; }
+[[nodiscard]] inline double dipole_moment(const M& model) {
     const double g10 = model.g(1, 0);
     const double g11 = model.g(1, 1);
     const double h11 = model.h(1, 1);

@@ -495,8 +495,9 @@ inline void root_step(RootState& s, double f_at_b, double tol) {
  * @alloc none — both spans are the caller's.
  * @test IrbemDriftShell.FluxCellsAgreeBetweenLanes
  */
-template <int NMAX>
-inline void stage_model(const Igrf<NMAX>& model, std::span<float> coef, std::span<float> norm) {
+template <GeoFieldModel M>
+inline void stage_model(const M& model, std::span<float> coef, std::span<float> norm) {
+    constexpr int NMAX = M::degree;
     constexpr std::size_t kSlots = ((NMAX + 1) * (NMAX + 2)) / 2;
     std::fill(coef.begin(), coef.end(), 0.0F);
     for (int deg = 1; deg <= NMAX; ++deg) {
@@ -553,21 +554,28 @@ inline void stage_model(const Igrf<NMAX>& model, std::span<float> coef, std::spa
  * @alloc none here; the device lane's buffers come from the context's pool.
  * @test IrbemDriftShell.FluxCellsAgreeBetweenLanes
  */
-template <int NMAX>
-[[nodiscard]] inline bool field_batch(const Igrf<NMAX>& model, std::span<const float> coef,
+template <GeoFieldModel M>
+[[nodiscard]] inline bool field_batch(const M& model, std::span<const float> coef,
                                       std::span<const float> norm, std::span<const float> pos,
                                       std::span<float> out) {
     const std::size_t n = pos.size() / 3;
 #ifdef CHEATAH_SPACE_IRBEM_LSTAR_GPU
-    if (gpu::prefer_gpu("irbem_igrf_f32", n)) {
-        const std::array<std::uint32_t, 2> dims{static_cast<std::uint32_t>(n),
-                                                static_cast<std::uint32_t>(NMAX)};
-        if (gpu::launch_igrf(pos, coef, norm, dims, out)) return true;
+    // The device fast-path stages ONE internal model's coefficients, so it applies only when the
+    // model IS that internal model. A composed model (internal plus external) takes the host loop
+    // below, whose `model.evaluate` is the total field — which is also the correct physics for the
+    // flux quadrature: IRBEM's own cap integral evaluates the total field, and evaluating only the
+    // internal part there would bias Phi by the external field's ~0.1-0.3% at r = 1, comparable to
+    // the whole L* budget during a storm.
+    if constexpr (is_igrf_v<M>) {
+        if (gpu::prefer_gpu("irbem_igrf_f32", n)) {
+            const std::array<std::uint32_t, 2> dims{static_cast<std::uint32_t>(n),
+                                                    static_cast<std::uint32_t>(M::degree)};
+            if (gpu::launch_igrf(pos, coef, norm, dims, out)) return true;
+        }
     }
-#else
+#endif
     (void)coef;
     (void)norm;
-#endif
     for (std::size_t i = 0; i < n; ++i) {
         const Position<Frame::GEO> p{fixarray::vec3d{pos[(3 * i) + 0], pos[(3 * i) + 1],
                                                      pos[(3 * i) + 2]}};
@@ -616,8 +624,8 @@ template <int NMAX>
  * @test IrbemDriftShell.FootpointsAgreeBetweenLanes
  * @test IrbemDriftShell.FootpointOfADipoleLineIsTheAnalyticColatitude
  */
-template <int NMAX>
-[[nodiscard]] inline Result<Position<Frame::GEO>> walk_to_surface(const Igrf<NMAX>& model,
+template <GeoFieldModel M>
+[[nodiscard]] inline Result<Position<Frame::GEO>> walk_to_surface(const M& model,
                                                                   const Position<Frame::GEO>& start,
                                                                   bool northward,
                                                                   const TraceOptions& opt) {
@@ -696,8 +704,8 @@ inline constexpr std::size_t kFluxChunk = 1U << 20U;
  * @test IrbemDriftShell.ResidualIsMonotoneAcrossTheAccessibilityBoundary
  * @test IrbemDriftShell.ResidualIsMonotoneInTheShellRadius
  */
-template <int NMAX>
-[[nodiscard]] inline bool residual_round(const Igrf<NMAX>& model, const fixarray::mat3d& mag_to_geo,
+template <GeoFieldModel M>
+[[nodiscard]] inline bool residual_round(const M& model, const fixarray::mat3d& mag_to_geo,
                                          std::span<const float> coef, std::span<const float> norm,
                                          std::span<const double> azimuth,
                                          std::span<const double> b_mirror,
@@ -800,8 +808,8 @@ template <int NMAX>
  * @test IrbemDriftShell.MatchesTheOracleAtIrbemDefaultResolution
  * @test IrbemDriftShell.UsesTheDeviceWhenOneIsAvailable
  */
-template <int NMAX>
-[[nodiscard]] inline Result<bool> make_lstar_batch(const Igrf<NMAX>& model,
+template <GeoFieldModel M>
+[[nodiscard]] inline Result<bool> make_lstar_batch(const M& model,
                                                    const Rotations& rotations,
                                                    std::span<const Position<Frame::GEO>> starts,
                                                    std::span<const double> pitch_angles_deg,
@@ -826,8 +834,8 @@ template <int NMAX>
     const fixarray::mat3d geo_to_mag = rotation_matrix<Frame::MAG, Frame::GEO>(rotations);
     const fixarray::mat3d mag_to_geo = rotation_matrix<Frame::GEO, Frame::MAG>(rotations);
 
-    std::vector<float> coef(detail::coefficient_slots(NMAX));
-    std::vector<float> norm(detail::normalisation_slots(NMAX));
+    std::vector<float> coef(detail::coefficient_slots(M::degree));
+    std::vector<float> norm(detail::normalisation_slots(M::degree));
     detail::stage_model(model, coef, norm);
 
     // ---- 1. the reference lines: one trace per point, in one batch ---------------------------
@@ -959,12 +967,19 @@ template <int NMAX>
     }
     bool foot_on_device = false;
 #ifdef CHEATAH_SPACE_IRBEM_LSTAR_GPU
-    if (gpu::prefer_gpu("irbem_shell_foot_f32", m)) {
-        const std::array<std::uint32_t, 4> dims{
-            static_cast<std::uint32_t>(m), static_cast<std::uint32_t>(NMAX),
-            static_cast<std::uint32_t>(opt.footpoint.max_steps),
-            static_cast<std::uint32_t>(opt.footpoint.steps_per_l * 1000.0)};
-        foot_on_device = gpu::launch_shell_foot(fpos, fdir, coef, norm, dims, foot, fstat);
+    // Igrf-only: irbem_shell_foot_f32 walks the INTERNAL field it was staged with. A total-field
+    // footpoint must walk the total field — the external part bends the last few steps near the
+    // cusp — so a composed model takes the generic host walk below, which evaluates the model it
+    // was given. When a combined footpoint kernel exists this guard widens; until then routing a
+    // total field through the internal kernel would be fast and wrong.
+    if constexpr (is_igrf_v<M>) {
+        if (gpu::prefer_gpu("irbem_shell_foot_f32", m)) {
+            const std::array<std::uint32_t, 4> dims{
+                static_cast<std::uint32_t>(m), static_cast<std::uint32_t>(M::degree),
+                static_cast<std::uint32_t>(opt.footpoint.max_steps),
+                static_cast<std::uint32_t>(opt.footpoint.steps_per_l * 1000.0)};
+            foot_on_device = gpu::launch_shell_foot(fpos, fdir, coef, norm, dims, foot, fstat);
+        }
     }
 #endif
     if (!foot_on_device) {
@@ -1121,8 +1136,8 @@ template <int NMAX>
  * @test IrbemDriftShell.MatchesTheOracleAtIrbemDefaultResolution
  * @test IrbemDriftShell.BatchMatchesThePointAtATimeCall
  */
-template <int NMAX>
-[[nodiscard]] inline Result<DriftShell> make_lstar(const Igrf<NMAX>& model,
+template <GeoFieldModel M>
+[[nodiscard]] inline Result<DriftShell> make_lstar(const M& model,
                                                    const Rotations& rotations,
                                                    const Position<Frame::GEO>& start,
                                                    double pitch_angle_deg = 90.0,

@@ -32,19 +32,26 @@
  * a pure rotation with no origin shift, unlike a `Position` transform; the frame-tagged types make
  * that distinction a compile error rather than a plausible wrong answer.
  *
- * ## What this is NOT
+ * ## The device lane
  *
- * This is the **host** superposition. The device lane's kernels upload one model's coefficients and
- * evaluate one model; a GPU trace through the total field needs a kernel that evaluates both, which
- * is a separate piece of work. So a batch traced through a `TotalField` runs on the CPU today, and
- * the GPU speedup quoted elsewhere is for the internal field. Saying otherwise would be the kind of
- * claim that is true of the benchmark and false of the library.
+ * @ref trace_invariant_batch below routes a `TotalFieldT89` batch to `irbem_trace_total_f32`,
+ * which evaluates BOTH models per RK4 stage on the device — `igrf_eval` and `t89_eval` are the
+ * same shared Slang functions the batched field kernels call, so each piece of physics exists on
+ * the device exactly once. The host stages three things per batch: the epoch-interpolated IGRF
+ * coefficients, the ONE Kp bin's T89 parameter block (a batch shares one epoch and one Kp — a
+ * per-thread bin branch would diverge the warp), and the epoch's `gsm_from_geo` rotation. Single
+ * traces and small batches stay on the host, below the same measured crossover the internal
+ * tracer uses.
  */
 
 #include <cmath>
 #include <numbers>
 
 #include "coords_rotations.hpp"
+#include "lstar.hpp"
+#include <span>
+#include <vector>
+
 #include "ext_t89.hpp"
 #include "frames.hpp"
 #include "igrf.hpp"
@@ -63,6 +70,10 @@ namespace cheatah::space::irbem {
 template <int NMAX = 10>
 class TotalFieldT89 {
   public:
+    /// The internal part's truncation degree — what generic staging and buffer sizing read, on
+    /// both this type and @ref Igrf, so `M::degree` means the same thing for either.
+    static constexpr int degree = NMAX;
+
     /**
      * @param internal the internal field, already built for the epoch.
      * @param rotations the epoch's frame rotations — built once, reused for every point.
@@ -119,6 +130,31 @@ class TotalFieldT89 {
     /// @test IrbemTotalField.SuperposesInternalAndExternal
     [[nodiscard]] constexpr double kp_times_ten() const { return kp_times_ten_; }
 
+    /// The epoch's frame rotations — what the device staging and any caller mapping frames needs.
+    /// @return the rotations this field was built with.
+    /// @complexity O(1). @alloc none.
+    /// @test IrbemTotalField.SuperposesInternalAndExternal
+    [[nodiscard]] constexpr const Rotations& rotations() const { return *rotations_; }
+
+    /// The internal part's Gauss coefficient `g(n, m)`, in nT.
+    ///
+    /// A superposition has no spherical-harmonic expansion of its own — the external field is not
+    /// current-free, so no scalar potential exists to expand. What a caller asking `g(1, 0)` of a
+    /// total field means, in every use this module has (the dipole moment `k0`, the trace step
+    /// sizing, the device staging of the internal part), is the INTERNAL field's coefficient, and
+    /// that is what this forwards to. Documented here precisely because silently answering a
+    /// question the physics cannot pose is how a wrong number acquires authority.
+    /// @param n the degree. @param m the order. @return the internal part's coefficient.
+    /// @complexity O(1). @alloc none.
+    /// @test IrbemTotalField.SuperposesInternalAndExternal
+    [[nodiscard]] constexpr double g(int n, int m) const { return internal_->g(n, m); }
+
+    /// The internal part's `h(n, m)`, in nT — see @ref g for why this forwards.
+    /// @param n the degree. @param m the order. @return the internal part's coefficient.
+    /// @complexity O(1). @alloc none.
+    /// @test IrbemTotalField.SuperposesInternalAndExternal
+    [[nodiscard]] constexpr double h(int n, int m) const { return internal_->h(n, m); }
+
     /// The internal field alone — what `dipole_moment` and the device staging need, since those
     /// are questions about the internal field specifically and a superposition cannot answer them.
     /// @return the internal model.
@@ -131,5 +167,120 @@ class TotalFieldT89 {
     const Rotations* rotations_;
     double kp_times_ten_;
 };
+
+
+/**
+ * Trace a batch of field lines through the TOTAL field — the GPU-default entry point.
+ *
+ * The shape mirrors the internal field's @ref trace_invariant_batch exactly: device above the
+ * measured crossover, the fp64 host loop below it or when no device answers, and the returned
+ * value says which lane actually served the call — a silent CPU fallback is the failure mode that
+ * makes a performance claim worthless, so it is observable by construction.
+ *
+ * @tparam NMAX the internal field's truncation degree.
+ * @param field the superposed model; carries the epoch's rotations and the batch's Kp.
+ * @param starts the starting positions, GEO, Earth radii.
+ * @param pitch_angles_deg the local pitch angle at each start; same length as @p starts.
+ * @param out one @ref FieldLine per input. @param statuses one @ref Status per input.
+ * @param opt the tracing options.
+ * @return @ref Status::Ok when every line closed; the value is `true` when the DEVICE served the
+ *         call.
+ * @complexity O(lines x steps) total-field evaluations (~900 flops each); concurrent on device.
+ * @alloc staging vectors for the device lane; the host lane allocates nothing.
+ * @test IrbemTotalField.BatchAgreesWithTheReferenceLane
+ * @test IrbemTotalField.BatchUsesTheDeviceWhenOneIsAvailable
+ */
+template <int NMAX>
+[[nodiscard]] inline Result<bool> trace_invariant_batch(
+    const TotalFieldT89<NMAX>& field, std::span<const Position<Frame::GEO>> starts,
+    std::span<const double> pitch_angles_deg, std::span<FieldLine> out, std::span<Status> statuses,
+    const TraceOptions& opt = {}) {
+
+    const std::size_t n = starts.size();
+    if (pitch_angles_deg.size() != n || out.size() != n || statuses.size() != n) {
+        return {Status::DomainError, false};
+    }
+    if (n == 0) return {Status::Ok, false};
+
+#ifdef CHEATAH_SPACE_IRBEM_LSTAR_GPU
+    if (gpu::prefer_gpu("irbem_trace_total_f32", n)) {
+        // --- stage: IGRF coefficients + normalisation, epoch-interpolated ONCE on the host ------
+        constexpr int kSlots = ((NMAX + 1) * (NMAX + 2)) / 2;
+        const Igrf<NMAX>& igrf = field.internal();
+        std::vector<float> coef(2 * kSlots, 0.0F);
+        for (int deg = 1; deg <= NMAX; ++deg) {
+            for (int m = 0; m <= deg; ++m) {
+                const std::size_t k = (static_cast<std::size_t>(deg) * (deg + 1)) / 2 + m;
+                coef[k] = static_cast<float>(igrf.g(deg, m));
+                coef[kSlots + k] = static_cast<float>(igrf.h(deg, m));
+            }
+        }
+        constexpr auto kNorm = detail::make_legendre_normalisation<NMAX, double>();
+        std::vector<float> nrm(2 * kSlots + NMAX + 1, 0.0F);
+        for (int k = 0; k < kSlots; ++k) {
+            nrm[static_cast<std::size_t>(k)] = static_cast<float>(kNorm.e[static_cast<std::size_t>(k)]);
+            nrm[static_cast<std::size_t>(kSlots + k)] =
+                static_cast<float>(kNorm.f[static_cast<std::size_t>(k)]);
+        }
+        for (int deg = 0; deg <= NMAX; ++deg) {
+            nrm[static_cast<std::size_t>(2 * kSlots + deg)] =
+                static_cast<float>(kNorm.diagonal[static_cast<std::size_t>(deg)]);
+        }
+
+        // --- stage: the ext block — one Kp bin's T89 parameters + gsm_from_geo -----------------
+        const double tilt_rad = field.rotations().dipole_tilt_deg * (std::numbers::pi / 180.0);
+        const std::array<float, t89_param_count> par = t89_param_block(
+            static_cast<float>(std::sin(tilt_rad)), static_cast<float>(std::cos(tilt_rad)),
+            t89_kp_bin(field.kp_times_ten()));
+        std::vector<float> ext(t89_param_count + 9, 0.0F);
+        for (std::size_t k = 0; k < t89_param_count; ++k) ext[k] = par[k];
+        const fixarray::mat3d r = rotation_matrix<Frame::GSM, Frame::GEO>(field.rotations());
+        // fixarray matrices are column-major, which is precisely the layout the kernel reads.
+        const double* rd = r.data();
+        for (std::size_t k = 0; k < 9; ++k) ext[t89_param_count + k] = static_cast<float>(rd[k]);
+
+        // --- stage: positions and pitches -------------------------------------------------------
+        std::vector<float> pos(3 * n);
+        std::vector<float> pitch(n);
+        for (std::size_t i = 0; i < n; ++i) {
+            pos[(3 * i) + 0] = static_cast<float>(starts[i].v[0]);
+            pos[(3 * i) + 1] = static_cast<float>(starts[i].v[1]);
+            pos[(3 * i) + 2] = static_cast<float>(starts[i].v[2]);
+            pitch[i] = static_cast<float>(pitch_angles_deg[i]);
+        }
+        const std::array<std::uint32_t, 4> dims{
+            static_cast<std::uint32_t>(n), static_cast<std::uint32_t>(NMAX),
+            static_cast<std::uint32_t>(opt.max_steps),
+            static_cast<std::uint32_t>(opt.steps_per_l * 1000.0)};
+
+        std::vector<float> raw(4 * n);
+        std::vector<std::uint32_t> st(n);
+        if (gpu::launch_trace_total(pos, pitch, coef, nrm, ext, dims, raw, st)) {
+            bool all_ok = true;
+            for (std::size_t i = 0; i < n; ++i) {
+                out[i] = FieldLine{};
+                out[i].invariant_i = raw[(4 * i) + 0];
+                out[i].b_min = raw[(4 * i) + 1];
+                out[i].b_mirror = raw[(4 * i) + 2];
+                out[i].b_local = raw[(4 * i) + 3];
+                statuses[i] = st[i] < status_count ? static_cast<Status>(st[i]) : Status::DomainError;
+                all_ok = all_ok && (statuses[i] == Status::Ok);
+            }
+            return {all_ok ? Status::Ok : Status::OpenFieldLine, true};
+        }
+        // No device / no SPIR-V after all: fall through to the host, which is a deployment
+        // situation and not a reason to refuse to compute.
+    }
+#endif
+
+    bool all_ok = true;
+    for (std::size_t i = 0; i < n; ++i) {
+        const Result<FieldLine> r = trace_invariant(field, starts[i], pitch_angles_deg[i], opt);
+        out[i] = r.value;
+        statuses[i] = r.status;
+        all_ok = all_ok && (r.status == Status::Ok);
+    }
+    return {all_ok ? Status::Ok : Status::OpenFieldLine, false};
+}
 
 }  // namespace cheatah::space::irbem

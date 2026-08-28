@@ -6,6 +6,42 @@ alongside the other cheatah extensions.
 
 ## Unreleased
 
+### space.irbem — the TOTAL field runs on the GPU, and storms are verified against the reference
+
+The stated scope limit — "a TotalField batch runs on the CPU today" — is fixed, and the loop the
+storm corpus was built for is closed against the Fortran oracle.
+
+- **`irbem_trace_total_f32`**: the field-line trace through IGRF ⊕ T89, one thread per field line,
+  both models evaluated per RK4 stage on the device. T89's physics was factored into a shared
+  `t89_eval` (as `igrf_eval` already was), so each piece of physics exists on the device exactly
+  once. Eight bindings — the shared descriptor layout's cap; `Leases::capacity` moves 7 → 8 in the
+  same edit, by the rule the capacity-said-4 segfault taught. Verified device-run in all four
+  activity regimes, ~2 µs/line steady-state, fp32-vs-fp64 agreement 1.3–2.7e-05 (budget 1e-4).
+- **`make_lstar` is generic over `GeoFieldModel`.** The drift-shell machinery traces through the
+  combined kernel; the flux quadrature and footpoint walks evaluate the TOTAL field on the host
+  (IRBEM's own cap integral does the same — evaluating only the internal part there would bias Φ
+  by the external field's ~0.1–0.3% at r = 1, comparable to the whole L\* budget in a storm). The
+  internal-only device fast-paths are guarded by `if constexpr (is_igrf_v<M>)`: routing a total
+  field through a kernel staged with half its physics is a compile-time impossibility, not a
+  runtime surprise.
+- **The storm differential vs the oracle, `kext=4`, all seven Kp bins, matched `options=9`**:
+  worst |dL\*| 0.028–0.088 (bins 1–6), 0.123 (bin 7) — against 0.0066 for the internal field,
+  where both sides evaluate the same model. The order-of-magnitude contrast is the finding: the
+  numerics agree, the MODEL FAMILIES differ. IRBEM's `kext=4` is T89c, the 1992 revision that
+  added two tilt-modulation tail terms and refit with ISEE-1/2 data (Oulu reference
+  documentation), distributed only as GPL code and never published as equations — and the
+  free-parameter experiment already in `ext_t89.hpp` proves no refit of the published form can
+  close the gap. A clean room implements what was published; the harness reports the difference
+  instead of hiding it.
+- **`Status::NotConverged` is now covered by real physics**: a midnight L=9 shell under Kp ≥ 6
+  runs into T89's stretched tail and cannot close. The branch was unreachable with a pure
+  internal field (measured: every shell closes out to L=40) and untestable by mock (the machinery
+  was Igrf-typed); the first caller able to produce it was the storm itself.
+- The real-syscall lane of `space/cdf/mapping.hpp` got its first tests — the SysOps seam's fake
+  was covered while the production `PosixSysOps` sat at 0%, a seam inverted. Six float-induction
+  loops in the T89 divergence test became integer induction: accumulated `+=` rounding decided
+  whether endpoint samples ran, which in a divergence VERIFIER means silently weakening the check.
+
 ### space.irbem — the frame layer
 
 Work has begun on `space.irbem`, a from-scratch reimplementation of

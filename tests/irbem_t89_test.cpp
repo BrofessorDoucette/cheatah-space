@@ -110,9 +110,15 @@ double worst_divergence(double h, bool with_eq20) {
         for (int bin = 1; bin <= static_cast<int>(t89_bin_count); ++bin) {
             const T89Parameters<double> full = t89_parameters<double>(bin);
             const T89Parameters<double> p = with_eq20 ? full : without_eq20(full);
-            for (double x = -25.0; x <= 12.0; x += 3.7)
-                for (double y = -11.0; y <= 11.0; y += 3.3)
-                    for (double z = -9.0; z <= 9.0; z += 3.1) {
+            // Integer induction, coordinates derived per iteration: a floating accumulator both
+            // trips cert-flp30 and genuinely drifts — 11 additions of 3.7 is not 40.7 exactly, so
+            // whether the endpoint sample runs would depend on rounding.
+            for (int ix = 0; ix <= 10; ++ix)
+                for (int iy = 0; iy <= 6; ++iy)
+                    for (int iz = 0; iz <= 5; ++iz) {
+                        const double x = -25.0 + (3.7 * ix);
+                        const double y = -11.0 + (3.3 * iy);
+                        const double z = -9.0 + (3.1 * iz);
                         if (std::sqrt((x * x) + (y * y) + (z * z)) < 2.0) continue;
                         worst = std::max(worst, std::fabs(divergence(p, ps, x, y, z, h)));
                     }
@@ -926,9 +932,12 @@ TEST(IrbemT89, DiffersFromTheIrbemOracleByTheMeasuredEnvelope) {
                 o.coord_trans(&one, &si, &so, &iyear, &idoy, &ut, in.data(), outv.data());
                 ps = std::atan2(outv[0], outv[2]);
             }
-            for (double x = -30.0; x <= 14.0; x += 4.0)
-                for (double y = -12.0; y <= 12.0; y += 4.0)
-                    for (double z = -8.0; z <= 8.0; z += 4.0) {
+            for (int ix = 0; ix <= 11; ++ix)
+                for (int iy = 0; iy <= 6; ++iy)
+                    for (int iz = 0; iz <= 4; ++iz) {
+                        const double x = -30.0 + (4.0 * ix);
+                        const double y = -12.0 + (4.0 * iy);
+                        const double z = -8.0 + (4.0 * iz);
                         const double r = std::sqrt((x * x) + (y * y) + (z * z));
                         if (r < 3.0 || r > 35.0) continue;
                         std::array<double, 3> gsm{x, y, z};

@@ -72,10 +72,15 @@
  *
  * This is the model **as published in 1989**: the functional form of eqs. (11)-(20) and the
  * coefficients of the paper's Table 1. IRBEM's `kext = 4` is labelled "Tsyganenko [1989c]" and
- * evaluates a **later revision** whose parameters were never published in the paper and whose only
- * source is GPL-3.0 — which this MIT clean-room implementation may not read. The two are therefore
- * different parameterizations of the same model family, and the differential harness reports the
- * gap instead of hiding it rather than pretending to an agreement that does not exist.
+ * evaluates the **1992 revision**, which the community documentation describes (Oulu space-physics
+ * reference, magbase.rssi.ru/REFMAN/SPPHTEXT/bmodels.html) as differing in two ways: ISEE-1/2 data
+ * were added to the original IMP–HEOS fit, and **two terms were added to the tail field modes,
+ * modulating the tail current by the geodipole tilt** — a STRUCTURAL change to the equations, not
+ * a re-fit. That description matches what the free-refit experiment below measures independently:
+ * the revision was distributed only as code (GPL-3.0, which this MIT clean-room implementation may
+ * not read) and its equations were never published, so the published 1989 form is what a clean
+ * room can implement, and the differential harness reports the model-family gap instead of hiding
+ * it.
  *
  * Measured by [`tools/oracle/t89_diff.cpp`](../../../tools/oracle/t89_diff.cpp) against the `-O2`
  * oracle, at three dipole tilts (+0.0002, +25.64, -30.42 degrees), with the external field isolated
@@ -90,6 +95,13 @@
  *
  * Bin 7 is the worst by a wide margin and that is exactly the documented gap: IRBEM's revision
  * splits `Kp >= 5-` into two bins and this one cannot, because the seventh set was never published.
+ *
+ * Carried through the whole drift-shell chain (`make_lstar` over @ref TotalFieldT89, matched
+ * `options(3,4) = 9`, L = 3..6.6), the same model-family gap bounds L\*: worst `|dL*|` vs the
+ * oracle at `kext = 4` is 0.028–0.088 across bins 1–6 and 0.123 at bin 7 — against 0.0066 for the
+ * internal field alone, where both sides evaluate the SAME model. The order-of-magnitude contrast
+ * is the point: the numerics agree, the model families differ, and the gap sits exactly where the
+ * field-level table above predicts it.
  *
  * The same harness runs the experiment that says the rest of the gap is **structural, not a
  * re-fit**: letting all 19 linear coefficients of the published form float freely against the
