@@ -281,8 +281,22 @@ TEST(IrbemGmst, TheFractionalDayFoldingIsWorthAFactorOfHundreds) {
     // long double is 80-bit on x86-64 and 128-bit on aarch64; where it is merely double (MSVC) the
     // reference carries no extra precision and the comparison would be vacuous, so it is skipped
     // rather than silently weakened.
-    if (std::numeric_limits<long double>::digits < 64) {
-        GTEST_SKIP() << "long double carries no extra precision on this target";
+    // `numeric_limits` describes the TYPE, which is not the same as what the hardware will
+    // actually deliver at runtime. Under Valgrind the x87 unit is emulated in 64-bit, so
+    // `long double` still reports 64 bits of mantissa and silently rounds like a double — the
+    // reference then carries no extra precision, the comparison becomes vacuous, and this test
+    // fails for a reason that has nothing to do with the header it is testing.
+    //
+    // So probe the property the test actually depends on: a value that survives only with more
+    // than 53 bits of mantissa. This skips correctly under Valgrind, on MSVC where long double IS
+    // double, and on any future target that quietly narrows it — without naming any of them.
+    {
+        volatile long double probe = 1.0L;
+        probe += static_cast<long double>(std::numeric_limits<double>::epsilon()) / 2.0L;
+        if (std::numeric_limits<long double>::digits < 64 || probe == 1.0L) {
+            GTEST_SKIP() << "long double delivers no precision beyond double here, so the "
+                            "extended-precision reference would be vacuous";
+        }
     }
     double worst = 0.0;
     for (int step = -400; step <= 400; ++step) {
