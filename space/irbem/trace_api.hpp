@@ -226,24 +226,38 @@ namespace detail {
 /// The signed step that walks toward INCREASING `|B|` from @p p — the direction of the near mirror
 /// point, the near foot, and "the same magnetic hemisphere".
 ///
-/// One probe step rather than a gradient: the walk is along the field line, so what matters is
-/// which way the LINE's field rises, and a `∇|B|` at the point answers a different question wherever
-/// the line is curved. At a point exactly at the minimum both directions rise and `+ds` is
-/// returned, which is the reference's choice too.
+/// Probe steps rather than a gradient: the walk is along the field line, so what matters is which
+/// way the LINE's field rises, and a `∇|B|` at the point answers a different question wherever the
+/// line is curved.
+///
+/// **Both directions are probed and the LARGER wins, and that is load-bearing.** Comparing one
+/// probe against the start point instead is the obvious one-probe version and it is wrong within a
+/// step of the magnetic equator, where both neighbours are higher than the start: it then falls
+/// back on an arbitrary tie-break and picks the wrong hemisphere half the time. `|B|` falls
+/// monotonically toward the equator along a field line, so the neighbour with the LARGER `|B|` is
+/// always the one further from it — which is the answer in the generic case and in the degenerate
+/// one alike. This was not hypothetical: at (−7.492, −2.806, 0) in 2015 the magnetic equator sits
+/// 0.006 R_E away, the one-probe rule sent `FIND_FOOT_POINT`'s "same hemisphere" 130° of latitude
+/// to the wrong foot, and the differential sweep caught it. A genuine tie — a start exactly on the
+/// minimum — has no right answer and returns `+ds_mag`.
 ///
 /// @tparam NMAX the IGRF truncation degree.
 /// @param model the internal field model. @param p the position, GEO, Earth radii.
 /// @param b the field at @p p, nT, already known. @param ds_mag the unsigned step length.
 /// @return `+ds_mag` or `-ds_mag`.
-/// @complexity Four IGRF evaluations — one RK4 step. @alloc none.
+/// @complexity Eight IGRF evaluations — two RK4 steps — against a trace's several hundred.
+/// @alloc none.
 /// @test IrbemTraceApi.IncreasingFieldStepPointsAwayFromTheEquator
+/// @test IrbemTraceApi.IncreasingFieldStepIsRightBesideTheMagneticEquator
 template <int NMAX>
 [[nodiscard]] inline double increasing_field_step(const Igrf<NMAX>& model,
                                                   const Position<Frame::GEO>& p,
                                                   const fixarray::vec3d& b, double ds_mag) {
-    fixarray::vec3d probe{};
-    (void)rk4_step(model, p, b, ds_mag, probe);
-    return fixarray::norm(probe) >= fixarray::norm(b) ? ds_mag : -ds_mag;
+    fixarray::vec3d up{};
+    fixarray::vec3d down{};
+    (void)rk4_step(model, p, b, ds_mag, up);
+    (void)rk4_step(model, p, b, -ds_mag, down);
+    return fixarray::norm(up) >= fixarray::norm(down) ? ds_mag : -ds_mag;
 }
 
 /// A point found inside one RK4 step, with the field there.

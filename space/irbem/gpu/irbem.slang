@@ -440,3 +440,133 @@ void irbem_trace_i_f32(uint3 tid : SV_DispatchThreadID) {
 }
 
 #endif  // KERNEL_TRACE
+
+// =============================================================================================
+// irbem_shell_foot_f32 — the DRIFT-SHELL FOOTPOINT, one thread per shell azimuth.
+//
+// WHY THIS KERNEL EXISTS. L* is 2*pi*k0/(Phi*Re) with Phi the flux through the polar cap bounded
+// by the drift shell's IONOSPHERIC FOOTPOINTS. Everything upstream of that — the second invariant
+// I, the mirror field Bm, the per-azimuth root-find that finds which field line belongs to the
+// shell — is served by irbem_trace_i_f32 above. What no kernel yet produced is the one geometric
+// fact the flux integral is built on: WHERE each of those field lines meets r = 1.
+//
+// It cannot be folded into irbem_trace_i_f32. That kernel stops at the MIRROR points, which sit
+// well above the atmosphere for every trapped particle, and it stores no path — the whole reason
+// it is compute-bound rather than bandwidth-bound. Reaching the surface is a strictly longer walk
+// with a different termination test, so it is a different kernel rather than a flag on that one.
+//
+// WHY IT IS ON THE DEVICE. Per L* point this is Nder = 25 traces of ~250 RK4 steps, four IGRF
+// evaluations each: ~25 000 field evaluations, ~7.7 ms on the fp64 host lane and comparable to the
+// entire rest of the calculation. It is also perfectly parallel — every azimuth of every point is
+// independent — so it is the same bargain the tracer makes: ~16 bytes in, 12 out, ~10^5 flops
+// between them.
+//
+// THE LAST STEP IS REFINED, NOT INTERPOLATED. Marching at a fixed ds and then interpolating the
+// r = 1 crossing linearly across the final chord costs O(ds^2) in the footpoint's colatitude,
+// which at ds = L/50 is a tenth of a degree — an order of magnitude worse than the 0.25 degree
+// quadrature cell it feeds, and a systematic bias rather than noise. So a step that would cross
+// the surface is REJECTED and ds is halved instead, repeatedly, until it is below kFootTol. The
+// walk therefore lands ON the sphere to ~1e-5 Re along the line, the RK4 truncation stays the only
+// error, and the cost is ~2 extra steps per halving — some thirty steps out of ~250.
+//
+// DIRECTION IS AN INPUT, NOT A GUESS. Which way along B leads to the NORTHERN cap depends on the
+// hemisphere the seed sits in and on the sign of g10, and the kernel has no idea where the dipole
+// axis points — it works in GEO. The host, which does, passes +1 or -1 per line. That keeps the
+// hemisphere choice in one place instead of duplicating the dipole-axis convention on both sides
+// of the bus.
+//
+// bindings: 0 pos (3N floats, GEO seed, Re) | 1 dir (N floats, +1 or -1) | 2 coef | 3 norm
+//           4 out (3N floats: the footpoint, GEO, on the UNIT sphere) | 5 status (N uints)
+//           6 dims {N, nmax, max_steps, steps_per_l_x1000}
+// =============================================================================================
+#ifdef KERNEL_SHELL
+
+static const uint kShellOk = 0u;
+static const uint kShellOpen = 2u;          // matches Status::OpenFieldLine
+static const uint kShellDomain = 5u;        // matches Status::DomainError
+
+/// The step length below which the walk is considered to have landed on the surface, in Re.
+/// ~64 m: two orders below the 0.25-degree (28 km) quadrature cell the footpoint feeds, and still
+/// far above the fp32 resolution of a coordinate near 1.0 (6e-8 Re).
+static const float kFootTol = 1.0e-5f;
+
+[[vk::binding(0, 0)]] StructuredBuffer<float>   sh_pos;
+[[vk::binding(1, 0)]] StructuredBuffer<float>   sh_dir;
+[[vk::binding(2, 0)]] StructuredBuffer<float>   sh_coef;
+[[vk::binding(3, 0)]] StructuredBuffer<float>   sh_norm;
+[[vk::binding(4, 0)]] RWStructuredBuffer<float> sh_out;
+[[vk::binding(5, 0)]] RWStructuredBuffer<uint>  sh_status;
+[[vk::binding(6, 0)]] StructuredBuffer<uint>    sh_dims;
+
+/// The unit tangent B/|B|, or zero where the field vanishes.
+float3 sh_unit(float3 b) {
+    const float m = length(b);
+    return m > 0.0f ? b / m : float3(0.0f, 0.0f, 0.0f);
+}
+
+/// One RK4 step along dx/ds = B/|B|, carrying the arrival field forward as the next k1 — the same
+/// five-evaluations-into-four saving irbem_trace_i_f32 makes, for the same reason.
+float3 sh_rk4(int nmax, int slots, float3 p, float3 b_here, float ds, out float3 b_next) {
+    const float3 k1 = sh_unit(b_here);
+    const float3 k2 = sh_unit(igrf_eval(sh_coef, sh_norm, nmax, slots, p + k1 * (ds * 0.5f)));
+    const float3 k3 = sh_unit(igrf_eval(sh_coef, sh_norm, nmax, slots, p + k2 * (ds * 0.5f)));
+    const float3 k4 = sh_unit(igrf_eval(sh_coef, sh_norm, nmax, slots, p + k3 * ds));
+    const float3 out_p = p + (k1 + k2 * 2.0f + k3 * 2.0f + k4) * (ds / 6.0f);
+    b_next = igrf_eval(sh_coef, sh_norm, nmax, slots, out_p);
+    return out_p;
+}
+
+[shader("compute")]
+[numthreads(256, 1, 1)]
+void irbem_shell_foot_f32(uint3 tid : SV_DispatchThreadID) {
+    const uint n_lines = sh_dims[0];
+    const int nmax = int(sh_dims[1]);
+    const int max_steps = int(sh_dims[2]);
+    const float steps_per_l = float(sh_dims[3]) * 0.001f;
+    const uint i = tid.x;
+    if (i >= n_lines) return;
+
+    const int slots = ((nmax + 1) * (nmax + 2)) / 2;
+    float3 p = float3(sh_pos[3 * i + 0], sh_pos[3 * i + 1], sh_pos[3 * i + 2]);
+
+    sh_out[3 * i + 0] = 0.0f; sh_out[3 * i + 1] = 0.0f; sh_out[3 * i + 2] = 0.0f;
+
+    const float r0 = length(p);
+    if (!(r0 > 1.0f)) { sh_status[i] = kShellDomain; return; }
+
+    float3 b = igrf_eval(sh_coef, sh_norm, nmax, slots, p);
+    if (!(length(b) > 0.0f)) { sh_status[i] = kShellDomain; return; }
+
+    // The step is L/steps_per_l for the same reason the tracer's is: arc length and step both
+    // scale with L, so lanes carrying an L=2 line and an L=8 line retire together.
+    const float sin_lat = p.z / r0;
+    const float cos2 = 1.0f - sin_lat * sin_lat;
+    const float dipole_l = cos2 > 1e-12f ? r0 / cos2 : 1.0e3f;
+    float ds = sh_dir[i] * dipole_l / steps_per_l;
+
+    bool landed = false;
+    for (int k = 0; k < max_steps; ++k) {
+        float3 b_new;
+        const float3 q = sh_rk4(nmax, slots, p, b, ds, b_new);
+        if (length(q) < 1.0f) {
+            // The surface lies inside this step. Refuse it and halve, until the residual step is
+            // smaller than the quadrature can see; only then accept the point below the sphere.
+            if (abs(ds) < kFootTol) { p = q; landed = true; break; }
+            ds *= 0.5f;
+            continue;
+        }
+        p = q;
+        b = b_new;
+    }
+
+    // Report the footpoint ON the unit sphere: the caller reads a colatitude and a longitude off
+    // it, and normalising here means those are exact rather than carrying the last step's residual.
+    const float rp = length(p);
+    const float3 foot = rp > 0.0f ? p / rp : float3(0.0f, 0.0f, 1.0f);
+    sh_out[3 * i + 0] = foot.x;
+    sh_out[3 * i + 1] = foot.y;
+    sh_out[3 * i + 2] = foot.z;
+    sh_status[i] = landed ? kShellOk : kShellOpen;
+}
+
+#endif  // KERNEL_SHELL

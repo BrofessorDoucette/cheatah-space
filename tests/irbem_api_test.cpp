@@ -28,6 +28,7 @@
 #include <iterator>
 #include <limits>
 #include <numbers>
+#include <optional>
 #include <span>
 #include <vector>
 
@@ -201,19 +202,19 @@ constexpr CoordGolden kCoordGoldens[] = {
 // ---- helpers -----------------------------------------------------------------------------------
 
 /// The IGRF model for a (year, doy, ut) epoch — the argument @ref api::rotations_at needs.
-/// Aborts on an epoch outside IGRF-14's window, which is a fixture bug rather than a result.
-[[nodiscard]] ib::Igrf<> model_at(int year, int doy, double ut) {
+/// An epoch outside IGRF-14's window is a fixture bug rather than a result, so it aborts the test.
+[[nodiscard]] std::optional<ib::Igrf<>> model_at(int year, int doy, double ut) {
     const ib::DateTime dt = api::doy_and_ut2date_and_time(year, doy, ut);
-    const std::optional<ib::Igrf<>> m = ib::Igrf<>::at(
+    return ib::Igrf<>::at(
         api::date_and_time2decy(dt.year, dt.month, dt.day, dt.hour, dt.minute, dt.second));
-    EXPECT_TRUE(m.has_value());
-    return m.value_or(ib::Igrf<>{});
 }
 
 /// The rotations for a (year, doy, ut) epoch, built through the adapter's own entry point.
 [[nodiscard]] Rotations rotations_for(int year, int doy, double ut) {
-    const ib::Igrf<> m = model_at(year, doy, ut);
-    const Result<Rotations> r = api::rotations_at(year, doy, ut, m);
+    const std::optional<ib::Igrf<>> m = model_at(year, doy, ut);
+    EXPECT_TRUE(m.has_value()) << year;
+    if (!m.has_value()) return Rotations{};
+    const Result<Rotations> r = api::rotations_at(year, doy, ut, *m);
     EXPECT_EQ(r.status, Status::Ok);
     return r.value;
 }
@@ -264,7 +265,9 @@ TEST(IrbemApi, LibraryInfoMatchesTheReference) {
 // ---- the epoch object ---------------------------------------------------------------------------
 
 TEST(IrbemApi, RotationsAreBuiltOncePerEpoch) {
-    const ib::Igrf<> m = model_at(kYear, kDoy, kUt);
+    const std::optional<ib::Igrf<>> model = model_at(kYear, kDoy, kUt);
+    ASSERT_TRUE(model.has_value());
+    const ib::Igrf<>& m = *model;
     const Result<Rotations> a = api::rotations_at(kYear, kDoy, kUt, m);
     const Result<Rotations> b = api::rotations_at(kYear, kDoy, kUt, m);
     ASSERT_EQ(a.status, Status::Ok);

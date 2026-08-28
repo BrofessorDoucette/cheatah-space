@@ -221,7 +221,7 @@ inline constexpr std::size_t always_on_device = 1;
  * and cannot drift into a registry that allocates. Adding a kernel means adding a row here AND an
  * entry point there; the completeness test fails if only one of the two happens.
  */
-inline constexpr std::array<KernelInfo, 3> registered_kernels{{
+inline constexpr std::array<KernelInfo, 4> registered_kernels{{
     // MEASURED, RTX 3070 Ti / Vulkan, best of five per size, transfers included, against this
     // header's own host lane built -O2 -ffp-contract=off (n : device Mpts/s : host Mpts/s):
     //   2^10 : 14 : 444 | 2^14 : 145 : 440 | 2^16 : 240 : 440 | 2^18 : 280 : 446
@@ -272,6 +272,18 @@ inline constexpr std::array<KernelInfo, 3> registered_kernels{{
     {"irbem_trace_i_f32",
      "field-line trace and the second invariant I; one thread per FIELD LINE, whole RK4 chain "
      "on-device, no path stored",
+     7, 0, 512},
+
+    // MEASURED, RTX 3070 Ti / Vulkan — see driftshell.hpp's brief for the whole L* accounting.
+    // A footpoint walk is the tracer's arithmetic over a LONGER path: ~250 RK4 steps from the
+    // magnetic equator down to r = 1, four IGRF evaluations each, plus ~30 more spent halving the
+    // final step onto the sphere. ~16 bytes in and 12 out per line for ~5 x 10^5 flops, so the
+    // intensity is if anything higher than irbem_trace_i_f32's ~9 400 flops/byte and the crossover
+    // is inherited from it rather than re-derived: below ~512 lines the ~30 us submit floor
+    // dominates, above it the device runs away.
+    {"irbem_shell_foot_f32",
+     "drift-shell ionospheric footpoints; one thread per shell azimuth, the final step halved onto "
+     "r = 1 rather than interpolated across it",
      7, 0, 512},
 }};
 
@@ -732,6 +744,131 @@ inline void dispatch_batch(std::string_view kernel, std::span<const float> pos,
     {
         const detail::SpvDirScope scope(shader_dir().string());
         c.dispatch_1d("irbem_trace_i_f32", lease.data(), 7, n);
+    }
+    c.download(b_out, out.data(), out.size() * sizeof(float));
+    c.download(b_st, status.data(), status.size() * sizeof(std::uint32_t));
+    return true;
+#else
+    return false;
+#endif
+}
+
+/**
+ * Launch the IGRF field kernel over a batch of arbitrary points — the five-binding shape.
+ *
+ * `dispatch_batch` cannot express this one: it uploads a scalar parameter block, and IGRF has no
+ * scalars, only two tables. The tables arrive ALREADY interpolated to the epoch, because
+ * interpolating IGRF's 26-epoch table per thread would be one redundant copy per point of a
+ * calculation the host does once per batch.
+ *
+ * L\*'s flux integral is what made this worth exposing on the seam rather than leaving it inside a
+ * benchmark: `Phi` is one field evaluation per polar-cap cell, ~2 400 cells per L\* point and
+ * nothing else — exactly the ~20 flops/byte regime the registry measures the device winning by
+ * 8.37x in.
+ *
+ * @param pos 3N floats, GEO, Earth radii. @param coef `g` then `h`, pre-interpolated.
+ * @param norm the Legendre normalisation — `constexpr` on the host, so free to produce.
+ * @param dims `{N, nmax}`.
+ * @param out receives 3N floats: the field at each point, GEO, nT.
+ * @return `false` when there is no device or no compiled SPIR-V — the caller's cue to run the host
+ *         lane, not an error. Genuine misuse (mismatched spans) still throws.
+ * @throws std::invalid_argument when @p out is not the same length as @p pos.
+ * @complexity One dispatch over `ceil(N/256)` workgroups.
+ * @alloc five device buffers, returned to the context's size-classed pool on scope exit.
+ * @test IrbemDriftShell.FluxCellsAgreeBetweenLanes
+ */
+[[nodiscard]] inline bool launch_igrf(std::span<const float> pos, std::span<const float> coef,
+                                      std::span<const float> norm,
+                                      std::span<const std::uint32_t> dims, std::span<float> out) {
+    if (pos.size() % 3 != 0 || out.size() != pos.size()) {
+        throw std::invalid_argument("space.irbem gpu: launch_igrf wants two equal-length "
+                                    "xyz-interleaved spans");
+    }
+    const std::size_t n = pos.size() / 3;
+    if (n == 0) return true;
+    if (!available() || !std::filesystem::exists(shader_path("irbem_igrf_f32"))) return false;
+
+#if CHEATAH_SPACE_IRBEM_HAVE_GPU
+    namespace gl = detail::gl;
+    gl::detail::Context& c = gl::detail::ctx();
+    detail::Leases lease;
+    gl::detail::Buffer* b_pos = lease.add(c.new_data_buffer(pos.size() * sizeof(float)));
+    gl::detail::Buffer* b_out = lease.add(c.new_data_buffer(out.size() * sizeof(float)));
+    gl::detail::Buffer* b_cf = lease.add(c.new_buffer(coef.size() * sizeof(float)));
+    gl::detail::Buffer* b_nr = lease.add(c.new_buffer(norm.size() * sizeof(float)));
+    gl::detail::Buffer* b_dm = lease.add(c.new_buffer(dims.size() * sizeof(std::uint32_t)));
+    c.upload(b_pos, pos.data(), pos.size() * sizeof(float));
+    c.upload(b_cf, coef.data(), coef.size() * sizeof(float));
+    c.upload(b_nr, norm.data(), norm.size() * sizeof(float));
+    c.upload(b_dm, dims.data(), dims.size() * sizeof(std::uint32_t));
+    {
+        const detail::SpvDirScope scope(shader_dir().string());
+        c.dispatch_1d("irbem_igrf_f32", lease.data(), 5, n);
+    }
+    c.download(b_out, out.data(), out.size() * sizeof(float));
+    return true;
+#else
+    return false;
+#endif
+}
+
+/**
+ * Launch the drift-shell footpoint tracer — the second seven-binding shape.
+ *
+ * The companion to @ref launch_trace, and the step that turns a converged drift shell into the
+ * polar-cap boundary L\*'s flux integral is taken over. Each line walks from its magnetic-equator
+ * seed down to `r = 1` along @p dir, halving its step onto the sphere rather than interpolating
+ * across it; see the kernel's own header in `irbem.slang` for why that distinction is worth ~30
+ * extra steps.
+ *
+ * @param pos 3N floats, GEO, Earth radii — one magnetic-equator seed per shell azimuth.
+ * @param dir N floats, `+1` or `-1`: which way along B leads to the chosen hemisphere. The host
+ *        decides, because the kernel works in GEO and has no dipole axis to compare against.
+ * @param coef `g` then `h`, already interpolated to the epoch. @param norm the normalisation.
+ * @param dims `{N, nmax, max_steps, steps_per_l × 1000}`.
+ * @param out receives 3N floats: each footpoint in GEO, ON the unit sphere.
+ * @param status receives N status words, so one line that never reaches the surface reports itself
+ *        instead of spoiling the batch.
+ * @return `false` when there is no device or no compiled SPIR-V — the caller's cue to run the host
+ *         lane, not an error. Genuine misuse (mismatched spans) still throws.
+ * @throws std::invalid_argument when the spans do not agree.
+ * @complexity One dispatch over `ceil(N/256)` workgroups; O(N × steps) field evaluations, run
+ *             concurrently.
+ * @alloc seven device buffers, returned to the context's size-classed pool on scope exit.
+ * @test IrbemDriftShell.FootpointsAgreeBetweenLanes
+ */
+[[nodiscard]] inline bool launch_shell_foot(std::span<const float> pos, std::span<const float> dir,
+                                            std::span<const float> coef,
+                                            std::span<const float> norm,
+                                            std::span<const std::uint32_t> dims,
+                                            std::span<float> out,
+                                            std::span<std::uint32_t> status) {
+    const std::size_t n = dir.size();
+    if (pos.size() != 3 * n || out.size() != 3 * n || status.size() != n) {
+        throw std::invalid_argument("space.irbem gpu: shell-footpoint span lengths disagree");
+    }
+    if (n == 0) return true;
+    if (!available() || !std::filesystem::exists(shader_path("irbem_shell_foot_f32"))) return false;
+
+#if CHEATAH_SPACE_IRBEM_HAVE_GPU
+    namespace gl = detail::gl;
+    gl::detail::Context& c = gl::detail::ctx();
+    detail::Leases lease;
+    gl::detail::Buffer* b_pos = lease.add(c.new_data_buffer(pos.size() * sizeof(float)));
+    gl::detail::Buffer* b_dir = lease.add(c.new_buffer(dir.size() * sizeof(float)));
+    gl::detail::Buffer* b_cf = lease.add(c.new_buffer(coef.size() * sizeof(float)));
+    gl::detail::Buffer* b_nr = lease.add(c.new_buffer(norm.size() * sizeof(float)));
+    gl::detail::Buffer* b_out = lease.add(c.new_data_buffer(out.size() * sizeof(float)));
+    gl::detail::Buffer* b_st = lease.add(c.new_data_buffer(status.size() * sizeof(std::uint32_t)));
+    gl::detail::Buffer* b_dm = lease.add(c.new_buffer(dims.size() * sizeof(std::uint32_t)));
+    c.upload(b_pos, pos.data(), pos.size() * sizeof(float));
+    c.upload(b_dir, dir.data(), dir.size() * sizeof(float));
+    c.upload(b_cf, coef.data(), coef.size() * sizeof(float));
+    c.upload(b_nr, norm.data(), norm.size() * sizeof(float));
+    c.upload(b_dm, dims.data(), dims.size() * sizeof(std::uint32_t));
+    {
+        const detail::SpvDirScope scope(shader_dir().string());
+        c.dispatch_1d("irbem_shell_foot_f32", lease.data(), 7, n);
     }
     c.download(b_out, out.data(), out.size() * sizeof(float));
     c.download(b_st, status.data(), status.size() * sizeof(std::uint32_t));
