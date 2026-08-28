@@ -6,6 +6,46 @@ alongside the other cheatah extensions.
 
 ## Unreleased
 
+### space.cdf — the format layer
+
+The three headers everything above the bytes stands on. No records are parsed yet; this is what
+makes parsing them safe and testable.
+
+- **`types.hpp`** — the format's closed vocabulary: 17 data types, 21 encodings, 14 record types,
+  the CDR flag bits and the error set. The 21 encodings collapse to **four** decode classes, which
+  is the simplification the decoder rests on; NETWORK is plain big-endian IEEE, not XDR despite the
+  name. `CDF_REAL4`/`CDF_FLOAT` and `CDF_REAL8`/`CDF_DOUBLE` are distinct format codes with
+  identical layouts and both occur in real files, so both are carried rather than normalized away.
+  Every `switch` omits `default:` so an added enumerator is a compiler warning, not a silent gap.
+- **`bytes.hpp`** — the one bounds-checked reader. Every multi-byte load is `memcpy` + `bswap`,
+  never a cast to a wider pointer: CDF's fields are **unaligned by construction** (`GDRoffset` is
+  an 8-byte read at CDR offset 12; a VXR's `Last[]` starts at `28 + 4*Nentries`, odd-aligned for
+  odd counts), and a wide-pointer read of an unaligned address is undefined behaviour with UBSan
+  in the gate. All control integers are big-endian *regardless of the file's data encoding* — the
+  encoding governs values only.
+- **`require()`** — the chokepoint that makes 100% line coverage reachable on a parser. Each
+  validation is one line executed on every successful parse, with the `throw` in a single
+  function. Scattered `if (bad) throw` would make every throw its own uncovered line needing a
+  bespoke malformed file; that is why parsers famously stall short of full coverage.
+- **`mapping.hpp`** — the file is mapped once rather than read through a buffer pool (NASA's
+  library seeks and copies per record, which is what `CDFsetCacheSize` tunes). The syscalls sit
+  behind a `SysOps` policy because `mmap` failing is unreachable from any craftable input; in
+  production the policy is a stateless empty struct that inlines away.
+
+**Verified against a real NASA file, not against our own parser's opinion of one.** The expected
+values were decoded by hand from the OMNI `hro2_1min` byte stream before this code existed: CDR
+size 312, GDR at 320 = 8 + 312, encoding NETWORK, flags row-major + single-file, `zVDRhead` 21601,
+the `Epoch` zVDR at `CDF_EPOCH`/maxRec 44639, `NumElems` at field offset 64 — and `eof` equal to
+the file size exactly, the invariant that holds only when no checksum is present.
+
+Two traps found and recorded rather than patched over. `mapping.hpp` first measured 38% because
+the real-file tests were **skipping**: ctest runs the suite from the repo root and
+`scripts/coverage.sh` from `build/cov`, so a bare relative path resolved in one and not the other.
+A skipped test reads green, so the coverage run had quietly stopped exercising the real syscalls
+at all — the fake was covered and the production path was not. The corpus path is now searched
+upward from the working directory. And reaching the real `mmap`-failure branch needed something
+that opens and stats plausibly but cannot be mapped: a directory does exactly that.
+
 ### space.irbem — the TOTAL field runs on the GPU, and storms are verified against the reference
 
 The stated scope limit — "a TotalField batch runs on the CPU today" — is fixed, and the loop the
