@@ -18,7 +18,10 @@ set -euo pipefail
 cd "$(git rev-parse --show-toplevel)"
 
 shopt -s nullglob
-for h in space/space.hpp space/*/*.hpp; do
+# space.irbem nests: gpu/ holds the device seam and tables/ the IGRF coefficients, so the glob
+# reaches two levels. A header the glob misses is a header `biome add` cannot verify on load —
+# silently, which is the worst way for a signature scheme to fail.
+for h in space/space.hpp space/*/*.hpp space/*/*/*.hpp; do
     [ -f "$h" ] || continue
     # Sign from the header's own directory so the sidecar records just the basename (matching purrc).
     ( cd "$(dirname "$h")" && sha512sum "$(basename "$h")" > "$(basename "$h").sha512" )

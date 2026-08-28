@@ -4,6 +4,56 @@ All notable changes to cheatah-space. This project is **alpha** — expect break
 between releases. It is a cheatah standard-library extension and joins the Biome Standard
 alongside the other cheatah extensions.
 
+## Unreleased
+
+### space.irbem — the frame layer
+
+Work has begun on `space.irbem`, a from-scratch reimplementation of
+[PRBEM/IRBEM](https://github.com/PRBEM/IRBEM) written to the published papers. This first piece is
+the vocabulary the rest of the module is built from; no field model ships yet.
+
+- `space/irbem/frames.hpp`: the twelve reference frames, `FrameKind` (a frame's three components
+  are Cartesian, spherical or geodetic — that distinction is load-bearing and now typed), and the
+  frame-tagged `Position<F>` / `FieldVector<F>`.
+- **The frame lives in the type.** `Position<Frame::GEO>` and `Position<Frame::GSM>` are distinct
+  types, so the classic defect of this domain — passing one frame's numbers to a routine expecting
+  another, where every component is plausible and only the answer is wrong — is a compile error.
+  Both wrappers are the size of a `vec3d` and trivially copyable: the tag costs nothing at runtime.
+- IRBEM's runtime `sysaxes` integer enters the typed world through exactly one boundary conversion
+  (`frame_from_sysaxes`), which reports an out-of-range code as absent rather than defaulting to a
+  frame. The heliospheric frames correctly report that `sysaxes` cannot name them.
+- The geometry is `cheatah::fixarray` (`vec3d`, `norm`, column-major `mat3d`) — the module adds no
+  container types of its own.
+
+### The IRBEM oracle, and a measured error budget
+
+- `tools/oracle/` — a dev-only harness that builds the vendored IRBEM checkout and runs it as a
+  **black box** through its documented C entry points (`dlopen`, never linked into anything we
+  ship). It is outside every QA-gate scope and never runs in the gate.
+- `space/irbem/docs/ERROR_BUDGET.md` now carries **measured** numbers rather than estimates. The
+  two that matter:
+  - **Discretization at IRBEM's own recommended resolution is 1.2e-3 to 4.0e-3 relative** in L\*
+    (0.010–0.017 absolute at L≈6), across L≈2–8 and two external fields. That is *at or above* a
+    0.01 absolute target — so 0.01 is only meaningful at matched `options`, and the differential
+    suite must record which resolution it ran at.
+  - Convergence is **not monotonic**: `options=4` is repeatedly worse than `options=2`. The
+    first-order rectangle quadrature plus a fixed-step theta march is the largest accuracy lever
+    in the original algorithm.
+- The oracle is built **twice**, as-shipped and `-O2`, because **2.7x of IRBEM's cost is its
+  missing `-O` flag alone** (42.4 ms vs 15.5 ms per L\* evaluation). Benchmarks quote the `-O2`
+  build; anything else inflates our numbers before we write a line of physics.
+
+### Repo
+
+- `-ffp-contract=off` is now set **globally**. FMA contraction silently changes the last bit of
+  `a*b+c`, and `space.irbem`'s self-goldens are byte comparisons; a flag that must be remembered at
+  each target is one that will be forgotten at a target.
+- `scripts/cppcheck.sh` no longer analyses `space/*/vendor/`, the git-ignored dev-only reference
+  implementations. They are third-party, never built and never shipped, so their findings are not
+  ours to fix — the Doxyfile already excluded them for the same reason.
+- Coverage now reports **branches** (100%), which `space.time` alone could not exercise: it is
+  straight-line arithmetic with no branches at all.
+
 ## v0.1.0-alpha (2026-08-14) — the time module, house-gated
 
 The first release-shaped state of the repo: one working module, `space.time` (Julian Date,

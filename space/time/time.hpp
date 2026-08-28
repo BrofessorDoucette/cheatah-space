@@ -33,11 +33,6 @@
 
 #include <type_traits>
 
-// The calendar layer. Separate file, same module: `import space.time` gets both. It is exact
-// integer arithmetic with no dependency on anything above, and the CDF epoch types are built
-// on it — see civil.hpp for why two day-number algorithms live there.
-#include "civil.hpp"
-
 namespace cheatah::space::time {
 
 // ---- input concepts ---------------------------------------------------------------------

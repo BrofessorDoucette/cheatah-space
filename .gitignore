@@ -80,3 +80,7 @@ systests/check.hpp.sha512
 docs/xml/
 # The space.* module headers are hand-authored C++ and ARE committed (space/**/*.hpp),
 # each alongside its .sha512 sidecar (scripts/sign-modules.sh).
+
+# clang coverage artifacts, produced by scripts/coverage.sh runs
+*.profraw
+*.profdata

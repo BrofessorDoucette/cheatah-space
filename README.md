@@ -1,8 +1,9 @@
 # cheatah-space
 
 > ⚠️ **Work in progress.** Early alpha. `space.time` works, is fully covered, and is
-> QA-gated; `space.cdf` and `space.irbem` are roadmaps only. APIs, layout, and namespaces may
-> change until the first tagged release.
+> QA-gated; `space.irbem` has begun (its frame layer is in and gated, the models are not);
+> `space.cdf` is a roadmap only. APIs, layout, and namespaces may change until the first
+> tagged release.
 
 The first cheatah standard-library **extension**: the `space` package — astronomy and
 space-physics. Hand-authored, header-only C++20 (templated with concepts), surfaced in the
@@ -34,8 +35,8 @@ push (scripts/test-biome-install.sh).
 | module | what it is | status |
 |---|---|---|
 | **`space.time`** | Julian Date, Modified Julian Date, J2000, and the NASA **CDF_EPOCH** bridge. Templated with concepts (scalar `Value` \| numeric `ndarray` \| future datetime-struct `ndarray`). The pun (spacetime) is intended. | **working** → [space/time](space/time/) |
-| **`space.cdf`** | NASA **Common Data Format** I/O, written from scratch in C++. NASA's leap-second table and the TAI-UTC lookup are in; the reader is next. | **in progress** → [space/cdf](space/cdf/) |
-| **`space.irbem`** | Radiation-belt & magnetic-field models — a clean-room reimplementation of **[PRBEM/IRBEM](https://github.com/PRBEM/IRBEM)**. | roadmap → [space/irbem](space/irbem/) |
+| **`space.cdf`** | NASA **Common Data Format** I/O, written from scratch in C++. | roadmap → [space/cdf](space/cdf/) |
+| **`space.irbem`** | Radiation-belt & magnetic-field models — a from-scratch reimplementation of **[PRBEM/IRBEM](https://github.com/PRBEM/IRBEM)**, written to the published papers, vectorized on the CPU and with the field-line and drift-shell integrals evaluated in parallel on the GPU. | **in progress** → [space/irbem](space/irbem/) |
 
 The through-line: each module has a canonical reference (NASA CDF C lib, IRBEM Fortran) we
 verify against and then outperform. Those references are **optional, dev-only** oracles — never
@@ -63,7 +64,7 @@ cheatah-space/
 │   ├── space.hpp           # package umbrella — includes the submodules
 │   ├── time/time.hpp       # space.time  (C++20, concepts, vectorized)   [working]
 │   ├── cdf/                # space.cdf    (roadmap)
-│   └── irbem/              # space.irbem  (roadmap)
+│   └── irbem/              # space.irbem  (in progress: frames.hpp)
 ├── systests/               # cheatah (.purr) system tests, importing space.* end to end
 ├── tests/                  # C++ unit tests (GoogleTest) — the coverage + memcheck harness
 ├── scripts/                # qa_gate.sh + the individual checks it runs (see Developing)
@@ -109,14 +110,14 @@ committed by the gate:
 <!-- coverage:start -->
 | Metric | space package |
 |--------|---------------|
-| **Lines** | 100.00% (141/141) |
-| **Functions** | 100.00% (33/33) |
+| **Lines** | 100.00% (106/106) |
+| **Functions** | 100.00% (27/27) |
 | Regions | 100.00% |
 | Branches | 100.00% |
 <!-- coverage:end -->
 
-(The Branches metric lit up with `space/time/civil.hpp` — the calendar's leap-year and
-era-shifting arms are the package's first real branches, and all of them are exercised.)
+(`space.time` is straight-line arithmetic — it has no branches; the Branches metric will
+light up with `space.cdf`.)
 
 ## License
 

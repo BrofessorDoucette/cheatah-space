@@ -10,12 +10,12 @@
  *
  * Submodules:
  *   - space.time  — Julian dates & epoch conversions (the CDF_EPOCH bridge).   [working]
- *   - space.cdf   — NASA Common Data Format I/O.                                [building]
- *   - space.irbem — radiation-belt / magnetic-field models (IRBEM reimpl).      [roadmap]
+ *   - space.cdf   — NASA Common Data Format I/O.                                [roadmap]
+ *   - space.irbem — radiation-belt / magnetic-field models (IRBEM reimpl).      [building]
  */
 
 #include "time/time.hpp"
 #include "cdf/cdf.hpp"
-// #include "irbem/irbem.hpp"  // enabled when space.irbem lands
+#include "irbem/irbem.hpp"
 
 namespace cheatah::space {}

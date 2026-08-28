@@ -31,7 +31,7 @@ PURRC="$(find_tool purrc)"
 W="$(mktemp -d)"; trap 'rm -rf "$W"' EXIT
 total=0; failed=0
 
-for src in space/space.hpp space/*/*.hpp; do
+for src in space/space.hpp space/*/*.hpp space/*/*/*.hpp; do
     [ -f "$src" ] || continue
     # Extract every @code{.purr} … @endcode block with its starting line number, stripping the
     # Javadoc block-comment's leading " * " from each code line.

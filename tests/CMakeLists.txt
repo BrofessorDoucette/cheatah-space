@@ -36,16 +36,25 @@ if(NOT TARGET cheatah_ndarray)
     target_include_directories(cheatah_ndarray PUBLIC
         ${_cheatah_stdlib}/ndarray
         ${_cheatah_stdlib}/builtins
+        ${_cheatah_stdlib}/fixarray
     )
     target_compile_features(cheatah_ndarray PUBLIC cxx_std_20)
     set_target_properties(cheatah_ndarray PROPERTIES POSITION_INDEPENDENT_CODE ON)
 endif()
 
 add_executable(cheatah_space_tests
+    alloc_counter.cpp
     space_time_test.cpp
     space_civil_test.cpp
     space_cdf_leapseconds_test.cpp
-    space_civil_test.cpp
+    irbem_frames_test.cpp
+    irbem_policy_test.cpp
+    irbem_context_test.cpp
+    irbem_datetime_test.cpp
+    irbem_coords_rotations_test.cpp
+    irbem_coords_geodetic_test.cpp
+    irbem_coords_helio_test.cpp
+    irbem_igrf_test.cpp
 )
 target_link_libraries(cheatah_space_tests PRIVATE
     cheatah::space
@@ -63,3 +72,20 @@ if(CHEATAH_SPACE_SANITIZE)
 endif()
 
 gtest_discover_tests(cheatah_space_tests)
+
+# --- space.irbem's GPU lane -----------------------------------------------------------------
+# Its own target, so `ctest -L gpu` selects the device tests and nothing else — labelling the whole
+# suite would make the label mean nothing. Built only with CHEATAH_SPACE_GPU=ON; the seam itself is
+# already covered without a device by the __has_include path in the main suite.
+if(CHEATAH_SPACE_GPU)
+    add_executable(cheatah_space_gpu_tests irbem_gpu_test.cpp)
+    target_link_libraries(cheatah_space_gpu_tests PRIVATE
+        cheatah::space_gpu
+        cheatah_ndarray
+        GTest::gtest_main)
+    add_dependencies(cheatah_space_gpu_tests cheatah_space_shaders)
+    # Vendor driver caches leak by design; leak-checking the GPU lane reports the driver, not us.
+    gtest_discover_tests(cheatah_space_gpu_tests
+        TEST_PREFIX "gpu:"
+        PROPERTIES LABELS gpu ENVIRONMENT "ASAN_OPTIONS=detect_leaks=0")
+endif()

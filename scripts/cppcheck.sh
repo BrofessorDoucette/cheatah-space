@@ -29,6 +29,8 @@ cppcheck \
     -q \
     -j "$(nproc)" \
     -i build \
+    -i space/cdf/vendor \
+    -i space/irbem/vendor \
     space tests \
     || { echo "[cppcheck] performance/security findings above — fix them or annotate with // cppcheck-suppress"; exit 1; }
 
