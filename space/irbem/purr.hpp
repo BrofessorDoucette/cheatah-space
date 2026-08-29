@@ -200,7 +200,11 @@ inline constexpr long long lstar_slots = 7;
 
 /**
  * Magnetic local time at a geographic point — IRBEM's `GET_MLT`.
- * @param e the epoch. @param x1 @param x2 @param x3 the position. @param sysaxes its frame code.
+ * @param e the epoch, from @ref epoch_at.
+ * @param x1 first position component.
+ * @param x2 second position component.
+ * @param x3 third position component — read per @p sysaxes.
+ * @param sysaxes the frame code the components are in.
  * @return MLT in hours, folded into `[0, 24)`; a negative value signals a declined call, which
  *         cannot collide with a real MLT.
  * @complexity O(1) beyond the frame transform. @alloc none.
@@ -228,8 +232,11 @@ inline constexpr long long lstar_slots = 7;
 /**
  * Convert a position between any two of IRBEM's frames — its `COORD_TRANS`.
  * @param e the epoch, whose rotations the transform needs.
- * @param x1 @param x2 @param x3 the input components, read per @p sysaxes_in.
- * @param sysaxes_in the input frame code. @param sysaxes_out the output frame code.
+ * @param x1 first input component.
+ * @param x2 second input component.
+ * @param x3 third input component — read per @p sysaxes_in.
+ * @param sysaxes_in the frame the input is in.
+ * @param sysaxes_out the frame to convert to.
  * @return an `ndarray` of four values: the three output components, then the @ref Status code.
  * @complexity O(1) — at most two 3×3 products. @alloc one array of four doubles.
  * @test IrbemPurr.CoordTransRoundTrips
