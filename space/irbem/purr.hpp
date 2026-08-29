@@ -23,6 +23,7 @@
  * because that is what a researcher moving off the Fortran already knows.
  *
  * @code{.purr}
+ * import io
  * import fixarray
  * import space.irbem.purr as irbem
  *
@@ -125,6 +126,7 @@ struct Epoch {
  * @systest systests/test_irbem.purr
  *
  * @code{.purr}
+ * import io
  * import fixarray
  * import space.irbem.purr as irbem
  * io.print(irbem.status_name(0))          # -> Ok
@@ -161,6 +163,7 @@ inline constexpr long long lstar_slots = 7;
  * @systest systests/test_irbem.purr
  *
  * @code{.purr}
+ * import io
  * import fixarray
  * import space.irbem.purr as irbem
  * let e = irbem.epoch_at(2015, 182, 43200.0)
@@ -212,6 +215,7 @@ inline constexpr long long lstar_slots = 7;
  * @systest systests/test_irbem.purr
  *
  * @code{.purr}
+ * import io
  * import fixarray
  * import space.irbem.purr as irbem
  * let e = irbem.epoch_at(2015, 182, 43200.0)
