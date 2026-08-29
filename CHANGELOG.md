@@ -6,6 +6,50 @@ alongside the other cheatah extensions.
 
 ## Unreleased
 
+### space.irbem — four external field models, and a vectorised CPU lane
+
+`kext=1` Mead & Fairfield (1975), `kext=5` Olson-Pfitzer quiet (1977), `kext=6` Olson-Pfitzer
+dynamic (1988) and `kext=8` Ostapenko & Maltsev (1997) join T89, each written to its published
+paper and verified against the vendored Fortran oracle across the four corpus regimes and the four
+real storm events. Each ships the same shape: a host evaluator templated on the float type, per
+model validity through `status.hpp`, a **shared** Slang function outside every kernel guard so a
+tracer calls the same physics as a direct evaluation, a guarded kernel, and a registry row that a
+completeness test checks against the Slang entry points and the CMake shader table.
+
+Mead reaches **oracle parity at 2.1e-9 relative RMS** (870 grid points x 4 Kp bins x 3 tilts, worst
+single point 1.2e-7). Establishing that took a black-box provenance experiment rather than a
+transcription: a free 20-term quadratic fit to the isolated oracle field converges only in SM
+coordinates at a 4-degree-aberrated position, and refitting on the paper's own y-symmetric basis
+recovers all 68 published coefficients as 3-4 significant-figure decimals to 1e-9 relative.
+
+**Olson-Pfitzer dynamic carries a documented gap, not parity.** Its 1988 citation is a conference
+abstract with no equations and the OP77 parent is a McDonnell Douglas report: neither the
+functional form nor the coefficients were ever published. What ships is the documented structure --
+`B = s^3 B_q(s r) + dDst* R(r)` with `s = (P/P0)^(1/6)` -- with every constant from a citable
+source (CODATA, Chapman-Ferraro/Mead 1964, O'Brien & McPherron 2000, Dessler-Parker-Sckopke). It
+sits **~50% RMS-relative** from IRBEM's `kext=6` in the belts, with a measured structure floor of
+67.8%. The oracle's tail does follow the published pressure law (fitted `s` = 1.110/1.260/1.420
+/1.475 against a predicted 1.122/1.260/1.414/1.468), but inside 6.5 Re it is an amplitude scaling
+that no published relation predicts. Parity is unreachable without reading the LGPL source, which
+this clean room does not do. `div B = 0` holds regardless: the stencil residual falls as h^2.
+
+Every model is checked for divergence-free-ness by a second-order stencil whose residual must fall
+as h^2 -- the one correctness check that needs no oracle and cannot be satisfied by agreeing with a
+wrong reference.
+
+### space.irbem — the CPU batch lane vectorises across points
+
+The Legendre recursion cannot vectorise *within* one field evaluation (loop-carried, ~7 wide), so
+the batch lane was 84% scalar. `batch_soa.hpp` makes the **point index** the SIMD lane and keeps
+the n/m recursion loops outer: **362 -> 100 ns/point, 3.61x**, bit-identical to the scalar lane by
+`memcmp` across truncations, epochs, policies and tail lengths. An objdump test counts packed
+double ops in the strip symbol and fails if the lane ever decays to scalar (a scalar-row control
+takes it from 390 packed to 0). Bit identity is conditional on `-ffp-contract=off`, which the repo
+sets globally and the header now documents for consumers who build outside it.
+
+Three variants measured flat or worse and were reverted rather than shipped: autovectorised plain
+arrays (2.0x), 512-bit vector rows (0.65x -- double-pumped on AVX2), and 16-point strips (3.3x).
+
 ### space.cdf — the format layer
 
 The three headers everything above the bytes stands on. No records are parsed yet; this is what
