@@ -15,29 +15,51 @@ rather than pay it. That cost is the opportunity.
 
 Roederer's L\* for a point, against IGRF-14 — the invariant the belts are organised by:
 
+```purr
+import io
+import fixarray
+import space.irbem.purr as irbem
+
+# IGRF-14 and the frame rotations for one instant: 2015 day 182, 12:00 UT. Build it once.
+let e = irbem.epoch_at(2015, 182, 43200.0)
+
+# 6.6 Rₑ out on the GEO x-axis — geosynchronous — for a 90° (equatorially mirroring) particle.
+# sysaxes is IRBEM's frame code: 0 GDZ, 1 GEO, 2 GSM, 3 GSE, 4 SM, 5 GEI, 6 MAG, 7 SPH, 8 RLL.
+let c = irbem.make_lstar(e, 6.6, 0.0, 0.0, 1, 90.0)
+
+io.print("Lm     =", c[0])                        # 6.66772
+io.print("L*     =", c[1])                        # 6.66194
+io.print("Blocal =", c[2], "nT")
+io.print("status =", irbem.status_name(int(c[6])))
+```
+
+Frames convert by the same integer codes, and magnetic local time comes off the same epoch:
+
+```purr
+let gsm = irbem.coord_trans(e, 6.6, 0.0, 0.0, 1, 2)   # GEO -> GSM
+let mlt = irbem.get_mlt(e, 6.6, 0.0, 0.0, 1)          # hours, in [0, 24)
+```
+
+Nothing returns a sentinel. The status slot names why a call declined — an open field line, a point
+outside a model's fitted envelope, a shell that would not close — so you branch on a reason rather
+than learning to recognise `-1e31`.
+
+[`purr.hpp`](purr.hpp) is that cheatah surface. The rest of the module is a C++20 library and stays
+one: the frame lives in the type (`Position<Frame::GEO>`), the truncation degree and precision are
+template parameters, and batches take `std::span`. Those are correctness wins in C++ and things a
+cheatah program cannot spell, so the facade is the boundary [`frames.hpp`](frames.hpp) already
+describes — the runtime `sysaxes` integer entering the typed world at the API edge and nowhere else.
+It is a thin wrapper, held to that by a test asserting it returns *exactly* what the typed path
+returns, field for field. Reaching for the full C++ surface directly stays available:
+
 ```cpp
 #include "space/irbem/irbem.hpp"
 namespace ib = cheatah::space::irbem;
-
-// IGRF-14 at the epoch, and the frame rotations for that instant (year, day-of-year, UT seconds).
 const auto model = ib::Igrf<13>::at(2015.5).value();
 const auto rot   = ib::api::rotations_at(2015, 182, 43200.0, model);
-
-// A geographic point 6.6 Rₑ out — geosynchronous — for a 90° (equatorially mirroring) particle.
 const ib::Position<ib::Frame::GEO> p{cheatah::fixarray::vec3d{6.6, 0.0, 0.0}};
-const auto shell = ib::make_lstar(model, rot.value, p, 90.0,
-                                  ib::DriftShellOptions::from_irbem(0, 0));
-
-if (shell.status == ib::Status::Ok) {
-    shell.value.lstar;   // L*  — Roederer's drift-shell invariant, Earth radii
-    shell.value.lm;      // Lm  — McIlwain's L of the starting line
-    shell.value.b_min;   // |B| at the magnetic equator of that line, nT
-}
+const auto shell = ib::api::make_lstar(model, rot.value, p, ib::ExternalModel::None, 90.0, {});
 ```
-
-Every result carries a @ref Status rather than a sentinel: an open field line, a point outside a
-model's fitted envelope, and a shell that would not close are each a *named* outcome you can branch
-on, never a `-1e31` you have to recognise.
 
 ## Status
 
