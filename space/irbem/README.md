@@ -11,6 +11,32 @@ evaluation costs **~10⁵ magnetic-field model calls** — the [LANL\*
 model](https://gmd.copernicus.org/articles/2/113/2009/) resorted to a neural-network surrogate
 rather than pay it. That cost is the opportunity.
 
+Roederer's L\* for a point, against IGRF-14 — the invariant the belts are organised by:
+
+```cpp
+#include "space/irbem/irbem.hpp"
+namespace ib = cheatah::space::irbem;
+
+// IGRF-14 at the epoch, and the frame rotations for that instant (year, day-of-year, UT seconds).
+const auto model = ib::Igrf<13>::at(2015.5).value();
+const auto rot   = ib::api::rotations_at(2015, 182, 43200.0, model);
+
+// A geographic point 6.6 Rₑ out — geosynchronous — for a 90° (equatorially mirroring) particle.
+const ib::Position<ib::Frame::GEO> p{cheatah::fixarray::vec3d{6.6, 0.0, 0.0}};
+const auto shell = ib::make_lstar(model, rot.value, p, 90.0,
+                                  ib::DriftShellOptions::from_irbem(0, 0));
+
+if (shell.status == ib::Status::Ok) {
+    shell.value.lstar;   // L*  — Roederer's drift-shell invariant, Earth radii
+    shell.value.lm;      // Lm  — McIlwain's L of the starting line
+    shell.value.b_min;   // |B| at the magnetic equator of that line, nT
+}
+```
+
+Every result carries a @ref Status rather than a sentinel: an open field line, a point outside a
+model's fitted envelope, and a shell that would not close are each a *named* outcome you can branch
+on, never a `-1e31` you have to recognise.
+
 ## Status
 
 > **Implemented is not the same claim as verified.** Which models have been checked against the

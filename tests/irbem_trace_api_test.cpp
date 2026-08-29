@@ -295,7 +295,7 @@ TEST(IrbemTraceApi, IncreasingFieldStepIsRightBesideTheMagneticEquator) {
     // REGRESSION. At this start the magnetic equator is 0.006 R_E away, so BOTH neighbours are
     // higher than the start and the natural one-probe rule ("is the +ds neighbour higher than
     // here?") answers yes and walks the wrong way. The consequence was not subtle: FIND_FOOT_POINT
-    // returned the northern foot for Hemisphere::Same when the oracle — and the physics — say
+    // returned the northern foot for FootTarget::Same when the oracle — and the physics — say
     // southern, 130 degrees of latitude away. Comparing the TWO neighbours fixes it, because |B|
     // falls monotonically toward the equator, so the larger neighbour is always the far one.
     const Igrf<10> m = model();
@@ -318,7 +318,7 @@ TEST(IrbemTraceApi, IncreasingFieldStepIsRightBesideTheMagneticEquator) {
     // The start is SOUTH of the equator, so "away from the equator" is the −B-hat direction.
     EXPECT_LT(detail::increasing_field_step(m, start, b, 0.02), 0.0);
 
-    const auto foot = find_foot_point(m, start, 100.0, Hemisphere::Same);
+    const auto foot = find_foot_point(m, start, 100.0, FootTarget::Same);
     ASSERT_TRUE(foot.ok());
     EXPECT_LT(foot.value.position.latitude(), 0.0);
 }
@@ -535,9 +535,9 @@ TEST(IrbemTraceApi, TraceFieldLineRefusesADegenerateStart) {
     EXPECT_EQ(find_mirror_point(m, geo(4.0, 0.0, 0.0), 181.0).status, Status::DomainError);
     EXPECT_EQ(find_mirror_point(m, geo(4.0, 0.0, 0.0), 180.0).status, Status::DomainError)
         << "no perpendicular velocity, so no mirror point - and sin(180 deg) is 1.2e-16, not 0";
-    EXPECT_EQ(find_foot_point(m, geo(0.5, 0.0, 0.0), 100.0, Hemisphere::Same).status,
+    EXPECT_EQ(find_foot_point(m, geo(0.5, 0.0, 0.0), 100.0, FootTarget::Same).status,
               Status::DomainError);
-    EXPECT_EQ(find_foot_point(m, geo(4.0, 0.0, 0.0), std::nan(""), Hemisphere::Same).status,
+    EXPECT_EQ(find_foot_point(m, geo(4.0, 0.0, 0.0), std::nan(""), FootTarget::Same).status,
               Status::DomainError);
     EXPECT_EQ(trace_field_line_toward_earth(m, geo(4.0, 0.0, 0.0), std::span<PathPoint>{}).status,
               Status::DomainError);
@@ -549,7 +549,7 @@ TEST(IrbemTraceApi, FootPointRefusesAStartBelowTheRequestedAltitude) {
     const Igrf<10> m = model();
     // 1.05 R_E is ~331 km up; asking for the 1000 km surface from below it is not a trace that
     // terminates, it is a question with no answer on this side of the line.
-    EXPECT_EQ(find_foot_point(m, geo(0.55, 0.0, 0.9), 1000.0, Hemisphere::Same).status,
+    EXPECT_EQ(find_foot_point(m, geo(0.55, 0.0, 0.9), 1000.0, FootTarget::Same).status,
               Status::DomainError);
 }
 
@@ -559,8 +559,8 @@ TEST(IrbemTraceApi, FootPointLandsOnTheRequestedGeodeticAltitude) {
     for (const Position<Frame::GEO>& start : sweep_points()) {
         if (start.radius() <= 1.05) continue;
         for (const double alt : {100.0, 500.0, 1000.0}) {
-            for (const Hemisphere h : {Hemisphere::Same, Hemisphere::Opposite, Hemisphere::North,
-                                       Hemisphere::South}) {
+            for (const FootTarget h : {FootTarget::Same, FootTarget::Opposite, FootTarget::North,
+                                       FootTarget::South}) {
                 const auto foot = find_foot_point(m, start, alt, h);
                 if (!foot.ok()) continue;
                 worst = std::max(worst, std::abs(foot.value.position.radius() - alt));
@@ -578,14 +578,14 @@ TEST(IrbemTraceApi, FootPointLandsOnTheRequestedGeodeticAltitude) {
     EXPECT_LT(worst, 1e-6);
 }
 
-TEST(IrbemTraceApi, FootPointHemisphereFlagsSelectTheTwoFeet) {
+TEST(IrbemTraceApi, FootPointFootTargetFlagsSelectTheTwoFeet) {
     const Igrf<10> m = model();
     for (const Position<Frame::GEO>& start : sweep_points()) {
         if (start.radius() <= 1.05) continue;
-        const auto same = find_foot_point(m, start, 100.0, Hemisphere::Same);
-        const auto opposite = find_foot_point(m, start, 100.0, Hemisphere::Opposite);
-        const auto north = find_foot_point(m, start, 100.0, Hemisphere::North);
-        const auto south = find_foot_point(m, start, 100.0, Hemisphere::South);
+        const auto same = find_foot_point(m, start, 100.0, FootTarget::Same);
+        const auto opposite = find_foot_point(m, start, 100.0, FootTarget::Opposite);
+        const auto north = find_foot_point(m, start, 100.0, FootTarget::North);
+        const auto south = find_foot_point(m, start, 100.0, FootTarget::South);
         if (!same.ok() || !opposite.ok() || !north.ok() || !south.ok()) continue;
 
         // The two named hemispheres really are north and south...
@@ -661,7 +661,7 @@ TEST(IrbemTraceApi, TracesStopAtTheStepCap) {
     EXPECT_FALSE(line.value.truncated);      // room was not the problem
     EXPECT_EQ(find_magequator(m, geo(6.0, 0.0, 3.0), opt).status, Status::OpenFieldLine);
     EXPECT_EQ(find_mirror_point(m, geo(6.0, 0.0, 3.0), 5.0, opt).status, Status::OpenFieldLine);
-    EXPECT_EQ(find_foot_point(m, geo(6.0, 0.0, 3.0), 100.0, Hemisphere::Same, opt).status,
+    EXPECT_EQ(find_foot_point(m, geo(6.0, 0.0, 3.0), 100.0, FootTarget::Same, opt).status,
               Status::OpenFieldLine);
 }
 
@@ -698,11 +698,11 @@ TEST(IrbemTraceApi, FootPointReportsAnOpenLine) {
     // An altitude below r0 can never be reached: the trace stops at the surface first.
     PathTraceOptions opt;
     opt.r0 = 1.2;
-    const auto foot = find_foot_point(m, geo(4.0, 0.0, 0.0), 100.0, Hemisphere::Same, opt);
+    const auto foot = find_foot_point(m, geo(4.0, 0.0, 0.0), 100.0, FootTarget::Same, opt);
     EXPECT_EQ(foot.status, Status::OpenFieldLine);
     EXPECT_GT(foot.value.b_magnitude, 0.0);
     // A named hemisphere propagates the same refusal rather than silently trying the other side.
-    EXPECT_EQ(find_foot_point(m, geo(4.0, 0.0, 0.0), 100.0, Hemisphere::North, opt).status,
+    EXPECT_EQ(find_foot_point(m, geo(4.0, 0.0, 0.0), 100.0, FootTarget::North, opt).status,
               Status::OpenFieldLine);
 }
 
@@ -962,7 +962,7 @@ TEST(IrbemTraceApi, FootPointMatchesTheOracle) {
                 // altitude measures its termination error, not the two tracers. Asking for the
                 // altitude it actually reached puts both feet on the same surface.
                 const auto foot =
-                    find_foot_point(m, p, xfoot[0], static_cast<Hemisphere>(flag), opt);
+                    find_foot_point(m, p, xfoot[0], static_cast<FootTarget>(flag), opt);
                 if (!foot.ok()) continue;
                 ++compared;
                 worst_lat =

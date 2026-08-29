@@ -117,12 +117,17 @@ struct PathPoint {
 };
 
 /**
- * Which magnetic hemisphere @ref find_foot_point should walk to.
+ * Which foot @ref find_foot_point should walk to.
  *
  * The enumerator values ARE IRBEM's `hemi_flag` codes, so a caller porting from the Fortran can
  * pass its integer through `static_cast` and a reader of either can check the other.
+ *
+ * @note Distinct from @ref Hemisphere, which reports the hemisphere a point IS in (IRBEM's `xHEMI`).
+ *       This one SELECTS a destination and carries two values `xHEMI` has no meaning for — `Same`
+ *       and `Opposite` are relative to the input point. They were both called `Hemisphere` until
+ *       the umbrella header included both and the compiler rejected the pair.
  */
-enum class Hemisphere : int {
+enum class FootTarget : int {
     Same = 0,       ///< The input point's own magnetic hemisphere — the direction of increasing `|B|`.
     North = 1,      ///< The northern foot.
     South = -1,     ///< The southern foot.
@@ -604,9 +609,9 @@ template <int NMAX>
  * oracle's own iteration converges to, and in the one place where an altitude error maps directly
  * onto an atmospheric density.
  *
- * @p hemisphere follows IRBEM's `hemi_flag`. @ref Hemisphere::Same walks in the direction of
+ * @p hemisphere follows IRBEM's `hemi_flag`. @ref FootTarget::Same walks in the direction of
  * increasing `|B|`, which is the input point's own side of the magnetic equator;
- * @ref Hemisphere::Opposite walks the other way. @ref Hemisphere::North and @ref Hemisphere::South
+ * @ref FootTarget::Opposite walks the other way. @ref FootTarget::North and @ref FootTarget::South
  * name a side outright: the same-hemisphere foot is traced first and, if its geodetic latitude has
  * the wrong sign, the other direction is traced instead. Classifying by the FOOT's latitude rather
  * than the start's is what makes the answer right for a start point below the magnetic equator but
@@ -626,13 +631,13 @@ template <int NMAX>
  *             four Bowring iterations, ~40 flops, against the step's ~2 000.
  * @alloc none.
  * @test IrbemTraceApi.FootPointMatchesTheOracle
- * @test IrbemTraceApi.FootPointHemisphereFlagsSelectTheTwoFeet
+ * @test IrbemTraceApi.FootPointFootTargetFlagsSelectTheTwoFeet
  * @test IrbemTraceApi.FootPointLandsOnTheRequestedGeodeticAltitude
  */
 template <int NMAX>
 [[nodiscard]] inline Result<FootPoint> find_foot_point(const Igrf<NMAX>& model,
                                                        const Position<Frame::GEO>& start,
-                                                       double stop_alt_km, Hemisphere hemisphere,
+                                                       double stop_alt_km, FootTarget hemisphere,
                                                        const PathTraceOptions& opt = {}) {
     FootPoint fp{};
     const double r_start = fixarray::norm(start.v);
@@ -685,11 +690,11 @@ template <int NMAX>
         return {Status::OpenFieldLine, out};
     };
 
-    if (hemisphere == Hemisphere::Same) return walk(same);
-    if (hemisphere == Hemisphere::Opposite) return walk(opposite);
+    if (hemisphere == FootTarget::Same) return walk(same);
+    if (hemisphere == FootTarget::Opposite) return walk(opposite);
 
     const Result<FootPoint> first = walk(same);
-    const double wanted = hemisphere == Hemisphere::North ? 1.0 : -1.0;
+    const double wanted = hemisphere == FootTarget::North ? 1.0 : -1.0;
     if (first.ok() && (first.value.position.latitude() * wanted) > 0.0) return first;
     if (!first.ok()) return first;
     return walk(opposite);

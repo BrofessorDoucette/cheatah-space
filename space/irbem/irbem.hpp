@@ -42,6 +42,17 @@
 #include "coords_helio.hpp"
 #include "igrf.hpp"
 #include "ext_t89.hpp"
+#include "ext_mead.hpp"
+#include "ext_opq.hpp"
+#include "ext_opd.hpp"
+#include "ext_ostapenko.hpp"
+#include "field.hpp"
+#include "batch_soa.hpp"
+#include "total_field.hpp"
+#include "lstar.hpp"
+#include "driftshell.hpp"
+#include "trace_api.hpp"
+#include "api.hpp"
 
 // The device lane is opt-in by include path, exactly as space.time's ndarray support is: a program
 // built without cheatah-gpu-linalg still compiles every routine here and simply has no GPU.
