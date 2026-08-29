@@ -71,7 +71,7 @@
 
 #include "cheatah.hpp"
 #include "fixarray.hpp"
-#include "space/irbem/frames.hpp"
+#include "frames.hpp"
 
 namespace cheatah::space::irbem {
 

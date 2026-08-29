@@ -59,9 +59,9 @@
 #include <cstddef>
 #include <optional>
 
-#include "space/irbem/frames.hpp"
-#include "space/irbem/policy.hpp"
-#include "space/irbem/tables/igrf14.hpp"
+#include "frames.hpp"
+#include "policy.hpp"
+#include "tables/igrf14.hpp"
 
 namespace cheatah::space::irbem {
 

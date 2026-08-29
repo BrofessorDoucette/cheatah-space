@@ -60,7 +60,7 @@
 #include <cstdint>
 #include <numbers>
 
-#include "space/irbem/frames.hpp"
+#include "frames.hpp"
 
 namespace cheatah::space::irbem {
 

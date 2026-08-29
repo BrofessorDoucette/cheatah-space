@@ -1,5 +1,5 @@
 #pragma once
-// cheatah-deps: ndarray
+// cheatah-deps: ndarray fixarray
 //
 // space.cdf hands variables back as ndarrays, so the package always needs it. purrc reads
 // this marker from the header it RESOLVES — `import space.cdf` resolves module `space`,

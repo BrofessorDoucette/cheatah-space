@@ -64,7 +64,7 @@
 #include <string>
 #include <string_view>
 
-#include "space/irbem/frames.hpp"
+#include "../frames.hpp"
 
 // The compile-time half of "is there a GPU?": whether the device stack was on the include path at
 // all. A consumer that builds without cheatah-gpu-linalg gets a header that still compiles, still
