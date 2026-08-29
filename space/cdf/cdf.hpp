@@ -23,6 +23,7 @@
  *   - `records.hpp`      the internal records (CDR/GDR/VDR/VXR/VVR/CVVR/CPR), parsed and validated.
  *   - `index.hpp`        a variable's VXR tree flattened, iteratively and capped, into extents.
  *   - `encoding.hpp`     one-pass decode of stored values into host doubles or int64s.
+ *   - `inflate.hpp`      DEFLATE (RFC 1951) from scratch — CDF's GZIP mode, no zlib.
  *   - `reader.hpp`       `open`, `var_names`, `values`, `values_i64` — the purr surface.
  *   - `leapseconds.hpp`  NASA's leap-second table as exact integers, plus TAI-UTC lookup.
  *
@@ -34,6 +35,7 @@
 #include "leapseconds.hpp"
 #include "encoding.hpp"
 #include "index.hpp"
+#include "inflate.hpp"
 #include "mapping.hpp"
 #include "reader.hpp"
 #include "records.hpp"

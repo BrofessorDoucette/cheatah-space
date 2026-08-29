@@ -39,6 +39,7 @@
 #include "bytes.hpp"
 #include "encoding.hpp"
 #include "index.hpp"
+#include "inflate.hpp"
 #include "mapping.hpp"
 #include "records.hpp"
 #include "types.hpp"
@@ -46,6 +47,10 @@
 namespace cheatah::space::cdf {
 
 namespace detail {
+
+/// A ceiling on how many records one compressed extent may claim, so a corrupt index cannot ask
+/// for an arbitrarily large scratch buffer before a single byte is decompressed.
+inline constexpr std::uint64_t kMaxRecordsPerExtent = 1U << 24;
 
 /// Everything an opened file knows. Built once, then only read.
 struct FileImpl {
@@ -236,12 +241,24 @@ inline ::cheatah::ndarray::basic_ndarray<Out> read_values(const File& f, const s
         require(e.first == cursor, gap, e.offset);
         const std::int64_t hi = std::min<std::int64_t>(e.last, n - 1);
         const auto count = static_cast<std::uint64_t>(hi - e.first + 1);
-        require(!e.compressed, ErrorCode::UnsupportedCompression, e.offset);
-        const RecordHeader h = expect_record(s.bytes, e.offset, RecordType::Vvr);
-        const Bytes data = vvr_data(s.bytes, h);
-        require(data.size() >= count * rec_bytes, ErrorCode::BadRecordSize, e.offset);
-        decode_run<Out>(data.data(), v.data_type, s.swap, count * elems,
-                        dst + static_cast<std::uint64_t>(cursor) * elems, e.offset);
+        if (e.compressed) {
+            // A CVVR holds the WHOLE extent compressed, so the full block is inflated even when
+            // only its first records are wanted — DEFLATE has no random access, and the trailing
+            // records of the last extent are allocation slack anyway.
+            const auto whole = static_cast<std::uint64_t>(e.last - e.first + 1);
+            require(whole <= kMaxRecordsPerExtent, ErrorCode::DecompressionFailed, e.offset);
+            const Cvvr c = parse_cvvr(s.bytes, e.offset);
+            std::vector<std::byte> plain(whole * rec_bytes);
+            inflate(c.payload, plain.data(), plain.size(), e.offset);
+            decode_run<Out>(plain.data(), v.data_type, s.swap, count * elems,
+                            dst + static_cast<std::uint64_t>(cursor) * elems, e.offset);
+        } else {
+            const RecordHeader h = expect_record(s.bytes, e.offset, RecordType::Vvr);
+            const Bytes data = vvr_data(s.bytes, h);
+            require(data.size() >= count * rec_bytes, ErrorCode::BadRecordSize, e.offset);
+            decode_run<Out>(data.data(), v.data_type, s.swap, count * elems,
+                            dst + static_cast<std::uint64_t>(cursor) * elems, e.offset);
+        }
         cursor = hi + 1;
     }
     require(cursor == n, gap, v.vxr_head);

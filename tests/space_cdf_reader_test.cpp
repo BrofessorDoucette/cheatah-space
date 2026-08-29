@@ -113,8 +113,8 @@ TEST(CdfReader, TestAlltypesReadsEveryUncompressedVariable) {
             continue;
         }
         if (v.compressed()) {
-            // GZIP lands in M8; until then the reader must refuse, not guess.
-            EXPECT_EQ(code_of([&] { (void)cdf::values(f, name); }), cdf::ErrorCode::UnsupportedCompression) << name;
+            // GZIP now decodes. The values are checked against the uncompressed twin below.
+            EXPECT_EQ(code_of([&] { (void)cdf::values(f, name); }), cdf::ErrorCode::None) << name;
             ++compressed;
             continue;
         }
@@ -319,10 +319,11 @@ TEST(CdfReader, RefusesWhatItDoesNotReadYetByName) {
     EXPECT_EQ(code_of([&] { (void)cdf::values(open_built(m), "x"); }), cdf::ErrorCode::BadRecordSize);
     m.blob.put_i64(m.vvr, 12 + 16);
 
-    // The extent points at a CVVR: compression is M8's job, so refuse for now.
+    // The extent points at a CVVR whose payload is not a DEFLATE stream at all: the decoder
+    // must reject it rather than emit whatever the bit reservoir happened to produce.
     m.blob.put_i32(m.vvr + 8, static_cast<std::int32_t>(cdf::RecordType::Cvvr));
     m.blob.put_i64(m.vvr + 16, 4);
-    EXPECT_EQ(code_of([&] { (void)cdf::values(open_built(m), "x"); }), cdf::ErrorCode::UnsupportedCompression);
+    EXPECT_EQ(code_of([&] { (void)cdf::values(open_built(m), "x"); }), cdf::ErrorCode::DecompressionFailed);
     m.blob.put_i32(m.vvr + 8, static_cast<std::int32_t>(cdf::RecordType::Vvr));
 
     // An extent past the record count is ignored, not an error: allocation slack is normal.
@@ -460,4 +461,136 @@ TEST(CdfEncoding, StorageKindAndTheUnknownArms) {
               cdf::ErrorCode::LossyConversion);
     EXPECT_EQ(code_of([&] { det::decode_run<long long>(src, cdf::DataType::Real8, false, 1, i, 0); }),
               cdf::ErrorCode::LossyConversion);
+}
+
+// ---- GZIP ----------------------------------------------------------------------------------------
+
+// test_alltypes.cdf carries `Longitude` (GZIP level 9) and `longitude_copy` (uncompressed) — the
+// same values stored both ways. That is the comparison the file exists to support, and it is a
+// far stronger check than any synthetic stream: it says our inflate agrees with the one NASA's
+// writer used, on bytes NASA produced.
+TEST(CdfInflate, GzipVariablesMatchTheirUncompressedTwin) {
+    const std::string path = corpus_path("tier0/test_alltypes.cdf");
+    if (path.empty()) { GTEST_SKIP() << "run: scripts/cdf-corpus.sh fetch"; }
+    const cdf::File f = cdf::open(path);
+
+    const auto zipped = cdf::values(f, "Longitude");
+    const auto plain = cdf::values(f, "longitude_copy");
+    const auto dup = cdf::values(f, "longitude_dup");
+    ASSERT_GT(zipped.size(), 0u);
+    ASSERT_EQ(zipped.size(), dup.size());
+    // `longitude_copy` holds twice the records (40 vs 20); the compressed pair must agree with
+    // its leading half value for value.
+    ASSERT_GE(plain.size(), zipped.size());
+    for (std::size_t i = 0; i < zipped.size(); ++i) {
+        EXPECT_EQ(flat(zipped)[i], flat(plain)[i]) << "at " << i;
+        EXPECT_EQ(flat(zipped)[i], flat(dup)[i]) << "at " << i;
+    }
+}
+
+// RBSP HOPE is the point of M8: 44 of its 45 variables are GZIP, so without inflate the file is
+// unreadable, and with it the whole mission archive opens.
+TEST(CdfInflate, RbspHopeOpensAndDecodes) {
+    const std::string path = corpus_path("tier1/rbspa_rel04_ect-hope-mom-l3_20130101_v7.1.0.cdf");
+    if (path.empty()) { GTEST_SKIP() << "run: scripts/cdf-corpus.sh fetch --tier 1"; }
+    const cdf::File f = cdf::open(path);
+    const det::FileImpl& s = f.state();
+
+    int gzip_vars = 0, decoded = 0;
+    for (const det::Vdr& v : s.vars) {
+        if (v.compressed()) { ++gzip_vars; }
+        if (v.s_records != cdf::SparseRecords::None || v.record_count() == 0) { continue; }
+        const std::string name(v.name);
+        const det::StorageKind kind = det::storage_kind(v.data_type);
+        const cdf::ErrorCode c = det::is_float_kind(kind)
+            ? code_of([&] { (void)cdf::values(f, name); })
+            : code_of([&] { (void)cdf::values_i64(f, name); });
+        EXPECT_EQ(c, cdf::ErrorCode::None) << name;
+        if (c == cdf::ErrorCode::None) { ++decoded; }
+    }
+    EXPECT_GT(gzip_vars, 40);
+    EXPECT_GT(decoded, 40);
+
+    // B_Eq is a GZIP'd REAL4 with real physics in it: finite, and not all the same value.
+    const auto b = cdf::values(f, "B_Eq");
+    ASSERT_GT(b.size(), 100u);
+    int finite = 0;
+    for (std::size_t i = 0; i < b.size(); ++i) {
+        if (std::isfinite(flat(b)[i]) && flat(b)[i] < 1e30) { ++finite; }
+    }
+    EXPECT_GT(finite, 10);
+}
+
+// The decompressor's own edges, driven directly — a malformed stream must be refused, never
+// guessed at, and never allowed to write outside the buffer the caller sized.
+TEST(CdfInflate, MalformedStreamsAreRefused) {
+    std::byte out[64];
+    auto run = [&](const std::vector<std::uint8_t>& in, std::uint64_t want) {
+        std::vector<std::byte> buf(in.size());
+        for (std::size_t i = 0; i < in.size(); ++i) { buf[i] = std::byte{in[i]}; }
+        return code_of([&] { det::inflate(det::Bytes(buf.data(), buf.size()), out, want, 0); });
+    };
+    EXPECT_EQ(run({}, 1), cdf::ErrorCode::DecompressionFailed);              // nothing at all
+    EXPECT_EQ(run({0x1F}, 1), cdf::ErrorCode::DecompressionFailed);          // one byte
+    EXPECT_EQ(run({0x1F, 0x8B, 0x08}, 1), cdf::ErrorCode::DecompressionFailed);  // truncated gzip header
+    EXPECT_EQ(run({0x1F, 0x8B, 0x09, 0, 0, 0, 0, 0, 0, 0}, 1), cdf::ErrorCode::DecompressionFailed);  // not DEFLATE
+    EXPECT_EQ(run({0x06}, 1), cdf::ErrorCode::DecompressionFailed);          // block type 3
+    EXPECT_EQ(run({0x01, 0x05, 0x00, 0x00, 0x00}, 5), cdf::ErrorCode::DecompressionFailed);  // stored, bad NLEN
+
+    // A well-formed stored block that produces fewer bytes than the record index promised.
+    EXPECT_EQ(run({0x01, 0x02, 0x00, 0xFD, 0xFF, 0xAA, 0xBB}, 4), cdf::ErrorCode::DecompressedSizeMismatch);
+    // …and one that produces more.
+    EXPECT_EQ(run({0x01, 0x04, 0x00, 0xFB, 0xFF, 1, 2, 3, 4}, 2), cdf::ErrorCode::DecompressedSizeMismatch);
+
+    // A valid stored block of exactly the right size round-trips.
+    std::vector<std::byte> in;
+    for (std::uint8_t b : {0x01, 0x03, 0x00, 0xFC, 0xFF, 0x41, 0x42, 0x43}) { in.push_back(std::byte{b}); }
+    EXPECT_NO_THROW(det::inflate(det::Bytes(in.data(), in.size()), out, 3, 0));
+    EXPECT_EQ(out[0], std::byte{0x41});
+    EXPECT_EQ(out[2], std::byte{0x43});
+}
+
+// Every container DEFLATE arrives in, and the two error paths a real stream never takes. The
+// fixtures are genuine streams produced by zlib, so this checks our decoder against the encoder
+// the rest of the world uses, not against itself.
+TEST(CdfInflate, AllThreeContainersAndTheRemainingErrorPaths) {
+    // "CDF" x 40 — long enough to force back-references, which is where a decoder usually breaks.
+    static constexpr std::uint8_t kRawDeflate[] = {0x73, 0x76, 0x71, 0x73, 0x1E, 0x08, 0x04, 0x00};
+    static constexpr std::uint8_t kZlibStream[] = {
+        0x78, 0xDA, 0x73, 0x76, 0x71, 0x73, 0x1E, 0x08, 0x04, 0x00, 0x92, 0x4D, 0x20, 0x09};
+    // gzip carrying FEXTRA | FNAME | FCOMMENT | FHCRC, so every optional-field skip is walked.
+    static constexpr std::uint8_t kGzipAllFlags[] = {
+        0x1F, 0x8B, 0x08, 0x1E, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03, 0x02, 0x00, 0x01, 0x02,
+        0x6E, 0x6D, 0x00, 0x63, 0x6D, 0x74, 0x00, 0x00, 0x00, 0x73, 0x76, 0x71, 0x73, 0x1E,
+        0x08, 0x04, 0x00, 0x8B, 0x54, 0xB7, 0x47, 0x78, 0x00, 0x00, 0x00};
+    constexpr std::size_t kLen = 120;
+
+    const auto check = [&](const std::uint8_t* in, std::size_t n) {
+        std::vector<std::byte> buf(n);
+        for (std::size_t i = 0; i < n; ++i) { buf[i] = std::byte{in[i]}; }
+        std::vector<std::byte> out(kLen);
+        det::inflate(det::Bytes(buf.data(), buf.size()), out.data(), out.size(), 0);
+        for (std::size_t i = 0; i < kLen; ++i) {
+            EXPECT_EQ(out[i], std::byte{static_cast<unsigned char>("CDF"[i % 3])}) << "at " << i;
+        }
+    };
+    check(kRawDeflate, sizeof(kRawDeflate));
+    check(kZlibStream, sizeof(kZlibStream));
+    check(kGzipAllFlags, sizeof(kGzipAllFlags));
+
+    std::byte out[8];
+    const auto run = [&](const std::vector<std::uint8_t>& in, std::uint64_t want) {
+        std::vector<std::byte> buf(in.size());
+        for (std::size_t i = 0; i < in.size(); ++i) { buf[i] = std::byte{in[i]}; }
+        return code_of([&] { det::inflate(det::Bytes(buf.data(), buf.size()), out, want, 0); });
+    };
+    // Block type 3 is reserved and must be refused. (Two bytes, because a one-byte input is
+    // rejected as too short to be any container before the block type is even looked at.)
+    EXPECT_EQ(run({0x06, 0x00}, 1), cdf::ErrorCode::DecompressionFailed);
+    // A dynamic block whose code-length alphabet is entirely zero: no code decodes to anything,
+    // so the symbol walk runs off the end of the table rather than returning a wrong symbol.
+    EXPECT_EQ(run({0x05, 0x00, 0x00, 0x00}, 1), cdf::ErrorCode::DecompressionFailed);
+    // A gzip header that claims optional fields the truncated input cannot contain.
+    EXPECT_EQ(run({0x1F, 0x8B, 0x08, 0x04, 0, 0, 0, 0, 0, 3, 0xFF, 0xFF}, 1),
+              cdf::ErrorCode::DecompressionFailed);
 }
