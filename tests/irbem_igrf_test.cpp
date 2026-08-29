@@ -274,6 +274,8 @@ TEST(IgrfNormalisation, IsTheSchmidtRecursionAndVanishesOnTheAliasedDiagonal) {
     check_normalisation_table<10, double>();
     check_normalisation_table<1, double>();
     check_normalisation_table<13, float>();
+    // degree 10 in fp32: the device-mirror lane the external field models compose with
+    check_normalisation_table<10, float>();
 }
 
 // ---- the coefficient table and its interpolation -----------------------------------------------
@@ -318,6 +320,57 @@ TEST(IgrfEpoch, RejectsDatesTheModelDoesNotCover) {
     ASSERT_TRUE(ib::Igrf<>::at(2030.0).has_value());
     EXPECT_EQ(ib::Igrf<>::at(1900.0)->year(), 1900.0);
     EXPECT_EQ(ib::Igrf<>::at(2030.0)->year(), 2030.0);
+}
+
+TEST(IgrfEpoch, TheTruncatedInstantiationTakesEveryEpochBranchToo) {
+    // The external field models compose with a degree-10 internal field, so `Igrf<10>` is a
+    // SECOND instantiation of `at()` — and coverage counts template lines per instantiation, so
+    // driving it only through the interpolation branch (which the model suites do) leaves the
+    // other two unexecuted even though `Igrf<>` covers them. Every branch, one instantiation.
+    using Truncated = ib::Igrf<10>;
+
+    // rejected, not clamped
+    EXPECT_FALSE(Truncated::at(1899.999).has_value());
+    EXPECT_FALSE(Truncated::at(2030.001).has_value());
+    EXPECT_FALSE(Truncated::at(std::numeric_limits<double>::quiet_NaN()).has_value());
+
+    // the secular-variation branch, past the last tabulated epoch
+    const auto extrapolated = Truncated::at(Truncated::latest_epoch_year + 1.0);
+    ASSERT_TRUE(extrapolated.has_value());
+    const auto at_epoch = Truncated::at(Truncated::latest_epoch_year);
+    ASSERT_TRUE(at_epoch.has_value());
+    // one year of secular variation is exactly the published rate — g(1,0) drifts, and by the
+    // tabulated amount rather than by some smoothed approximation
+    // NEAR, not DOUBLE_EQ: the 12.6 nT/yr drift is a difference between two coefficients of order
+    // 29 000 nT, so the subtraction cancels away ~three digits of the operands' precision. 1e-9 is
+    // far tighter than that cancellation and far looser than a wrong secular-variation term.
+    EXPECT_NEAR(extrapolated->g(1, 0) - at_epoch->g(1, 0),
+                tb::igrf14_g_sv[ib::detail::slot_index(1, 0)], 1e-9);
+
+    // and the interpolation branch, which the model suites exercise indirectly
+    ASSERT_TRUE(Truncated::at(1957.5).has_value());
+    EXPECT_EQ(Truncated::at(1957.5)->year(), 1957.5);
+}
+
+TEST(IgrfEpoch, TheTruncatedFloatLaneIsBuiltAndRunAtRuntime) {
+    // `Igrf<10, Fast>` is the fp32 device-MIRROR lane the external field models compose with: it
+    // exists so a host result can be compared against what the GPU kernel computes. Nothing ran it
+    // on the host, so its Legendre-normalisation table was an unexecuted instantiation — the table
+    // is constexpr, and a constexpr function that is only ever folded at compile time is never
+    // *executed*. Evaluating it here builds and runs it, and pins it against the fp64 lane.
+    const auto flt = ib::Igrf<10, ib::Fast>::at(2015.0);
+    const auto dbl = ib::Igrf<10, ib::Exact>::at(2015.0);
+    ASSERT_TRUE(flt.has_value());
+    ASSERT_TRUE(dbl.has_value());
+
+    // 2.5 Re out, off both the equator and the pole, so every order of the recursion contributes.
+    const ib::Position<ib::Frame::GEO> p{cheatah::fixarray::vec3d{1.4, 0.9, 1.7}};
+    const auto b_flt = flt->evaluate(p);
+    const auto b_dbl = dbl->evaluate(p);
+    ASSERT_GT(b_dbl.magnitude(), 0.0);
+    // fp32 on the integrand, fp64 on the sum: agreement to ~1e-6 relative is the lane's contract,
+    // and the error budget's justification for running the device integrand in single precision.
+    EXPECT_NEAR(b_flt.magnitude(), b_dbl.magnitude(), 1e-5 * b_dbl.magnitude());
 }
 
 TEST(IgrfEpoch, ReproducesEveryTabulatedEpochBitForBit) {
