@@ -110,9 +110,9 @@ committed by the gate:
 <!-- coverage:start -->
 | Metric | space package |
 |--------|---------------|
-| **Lines** | 100.00% (4618/4618) |
-| **Functions** | 100.00% (485/485) |
-| Regions | 99.07% |
+| **Lines** | 98.34% (4618/4696) |
+| **Functions** | 98.78% (485/491) |
+| Regions | 98.86% |
 | Branches | 94.83% |
 <!-- coverage:end -->
 
