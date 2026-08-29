@@ -1,0 +1,55 @@
+# space.irbem — the physics, exercised from cheatah through the purr facade.
+#
+# This program is the check that did not exist: the module was importable in principle for months
+# and no .purr file ever called it, so five repo-root #includes that purrc's include path cannot
+# satisfy went unnoticed. If irbem stops being callable from cheatah, this goes red.
+import io
+import fixarray
+import space.irbem.purr as irbem
+import check
+
+io.print("== space.irbem: magnetic coordinates from cheatah ==")
+let f = 0
+
+# --- the epoch handle ------------------------------------------------------------------------
+# It absorbs Igrf<13>::at, whose constructor is private behind a static factory on a class
+# template — the one thing a cheatah program provably cannot spell.
+let e = irbem.epoch_at(2015, 182, 43200.0)
+f += check.is_true("epoch 2015-182 is usable", irbem.epoch_ok(e))
+
+# Outside IGRF's published range the epoch declines rather than extrapolating silently.
+f += check.is_true("epoch before IGRF is refused", irbem.epoch_ok(irbem.epoch_at(1750, 1, 0.0)) == false)
+
+# --- L* at geosynchronous --------------------------------------------------------------------
+# 6.6 Re on the GEO x-axis. Lm and L* are both near the geocentric distance for a near-dipolar
+# internal field, and L* is the slightly smaller of the two.
+let c = irbem.make_lstar(e, 6.6, 0.0, 0.0, 1, 90.0)
+f += check.int_eq("make_lstar status", int(c[6]), 0)
+f += check.near_eq("Lm at 6.6 Re", c[0], 6.67, 0.05)
+f += check.near_eq("L* at 6.6 Re", c[1], 6.66, 0.05)
+f += check.is_true("L* <= Lm", c[1] <= c[0])
+f += check.is_true("Bmin <= Blocal", c[3] <= c[2])
+f += check.is_true("Blocal is a real field", c[2] > 50.0 and c[2] < 200.0)
+
+# MLT is a time of day, so it lives in [0, 24).
+let mlt = irbem.get_mlt(e, 6.6, 0.0, 0.0, 1)
+f += check.is_true("MLT in [0,24)", mlt >= 0.0 and mlt < 24.0)
+
+# --- frames ------------------------------------------------------------------------------------
+# GEO -> GSM -> GEO returns the input: the rotations compose to the identity.
+let gsm = irbem.coord_trans(e, 6.6, 0.0, 0.0, 1, 2)
+f += check.int_eq("coord_trans status", int(gsm[3]), 0)
+let back = irbem.coord_trans(e, gsm[0], gsm[1], gsm[2], 2, 1)
+f += check.near_eq("GEO->GSM->GEO x", back[0], 6.6, 0.000001)
+f += check.near_eq("GEO->GSM->GEO y", back[1], 0.0, 0.000001)
+f += check.near_eq("GEO->GSM->GEO z", back[2], 0.0, 0.000001)
+
+# A frame code outside 0..8 is a named error, never a plausible wrong number.
+let bad = irbem.coord_trans(e, 6.6, 0.0, 0.0, 1, 99)
+f += check.is_true("unknown sysaxes is refused", int(bad[3]) != 0)
+
+# --- statuses are named ------------------------------------------------------------------------
+f += check.is_true("status 0 is Ok", irbem.status_name(0) == "Ok")
+f += check.is_true("an unknown code does not throw", irbem.status_name(99) == "Unknown")
+
+check.result(f)

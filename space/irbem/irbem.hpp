@@ -52,6 +52,7 @@
 #include "lstar.hpp"
 #include "driftshell.hpp"
 #include "trace_api.hpp"
+#include "purr.hpp"
 #include "api.hpp"
 
 // The device lane is opt-in by include path, exactly as space.time's ndarray support is: a program
