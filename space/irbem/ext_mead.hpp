@@ -733,8 +733,7 @@ class TotalFieldMead {
         const double tilt_rad = rotations_->dipole_tilt_deg * (std::numbers::pi / 180.0);
         const Result<FieldVector<Frame::GSM>> b_ext = mead_field(p_gsm, tilt_rad, kp_times_ten_);
         if (b_ext.status == Status::DomainError) return b_int;
-        const FieldVector<Frame::GEO> b_ext_geo = transform<Frame::GEO>(b_ext.value, *rotations_);
-        return FieldVector<Frame::GEO>{b_int.v + b_ext_geo.v};
+        return FieldVector<Frame::GEO>{b_int.v + b_ext.value.v};
     }
 
     /**

@@ -1484,3 +1484,280 @@ void irbem_om97_f32(uint3 tid : SV_DispatchThreadID) {
 }
 
 #endif  // KERNEL_OSTAPENKO
+
+// ---------------------------------------------------------------------------------------------
+// irbem_t01s_f32 — the storm-time external field (IRBEM kext = 10), one thread per point.
+//
+// PHYSICS. Tsyganenko, Singer & Kasper, "Storm-time distortion of the inner magnetosphere: How
+// severe can it get?", JGR 108(A5), 1209 (2003), built on the Tsyganenko (2002a) structure,
+// JGR 107(A8), 1179. The 2003 paper publishes the module structure and the six drivers (Dst,
+// Pdyn, By, Bz, G2, G3) and NOT the coefficient set, so `space/irbem/ext_t01s.hpp` carries the
+// published structure as 108 exactly divergence-free spatial modes and calibrates their
+// amplitudes against the oracle as a black box. This kernel is the DEVICE MIRROR of that header:
+// the same 108 modes, the same expressions in the same order, in fp32 — the mode geometry below
+// is machine-generated from ext_t01s.hpp's `t01s_disc_modes` / `t01s_sheet_modes` /
+// `t01s_harmonic_modes` and `t01s_geometry`, so a table can never drift between the two lanes.
+//
+// THE AMPLITUDES ARE NOT COMPUTED HERE. Every point of a batch shares one driver state, so the
+// 108 amplitudes — each a linear combination of eleven smooth driver features — are solved ONCE on
+// the host (`t01s_param_block`) and ride in the parameter buffer. That is 1 188 multiply-adds
+// saved per thread, and it is what keeps the coefficient table off the device entirely.
+//
+// The three families, each solenoidal by construction (see ext_t01s.hpp's brief for the algebra):
+//   - DISCS, in SM: A = Q (-y, x, 0) with Q = W P h, so B = curl A has Bx = -x dQ/dz,
+//     By = -y dQ/dz, Bz = 2Q + x dQ/dx + y dQ/dy, every derivative TOTAL — through rho, through
+//     the T89 eq. (11) warped sheet surface, through the flankward thickening and through the
+//     eq. (12)-(13) truncation W. P is one of the three T89 eqs. (7)-(9) disc potentials.
+//   - SHEETS, in SM: B = curl(Lambda z_hat) = (dLambda/dy, -dLambda/dx, 0) — the partial ring
+//     current's radial closure.
+//   - HARMONICS, in GSM: B = grad gamma with gamma = exp(x/s) f(y/p) g(z/r) and
+//     1/s^2 = 1/p^2 + 1/r^2, so Laplacian(gamma) = 0 exactly (Tsyganenko 1995, JGR 100, 5599,
+//     eq. 24; 2002a §2) — the magnetopause shielding.
+// Plus the two uniform interconnection fields y_hat and z_hat.
+//
+// The sheet surface carries tan(psi), so cos(psi) must be non-zero; the host refuses |psi| >= 90
+// degrees before it ever packs a parameter block, which is why this kernel does not re-check it.
+//
+// bindings: 0 pos (3N floats, Re) | 1 out (3N floats, nT) | 2 params (110 floats: sin psi,
+//           cos psi, then the 108 mode amplitudes) | 3 dims {N}
+// ---------------------------------------------------------------------------------------------
+#ifdef KERNEL_T01S
+
+// ---- the mode geometry, generated from ext_t01s.hpp's tables ---------------------------------
+static const int kT01sDiscFam[58] = {
+    1, 2, 3, 1, 1, 1, 3, 1, 2, 3, 3, 3,
+    3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3,
+    3, 3, 3, 3, 3, 1, 1, 1, 1, 1, 1, 1,
+    1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 3, 3,
+    3, 3, 3, 3, 3, 3, 3, 3, 3, 3
+};
+static const float kT01sDiscA[58] = {
+    12.0f, 12.0f, 12.0f, 12.0f, 12.0f, 6.0f, 6.0f, 20.0f, 20.0f, 2.5f, 2.5f, 2.5f,
+    2.5f, 2.5f, 3.5f, 3.5f, 3.5f, 3.5f, 3.5f, 5.0f, 5.0f, 5.0f, 5.0f, 5.0f,
+    7.0f, 7.0f, 7.0f, 7.0f, 7.0f, 2.5f, 2.5f, 2.5f, 2.5f, 2.5f, 3.5f, 3.5f,
+    3.5f, 3.5f, 3.5f, 5.0f, 5.0f, 5.0f, 5.0f, 5.0f, 7.0f, 7.0f, 3.0f, 3.0f,
+    3.0f, 3.5f, 3.5f, 3.5f, 4.0f, 4.0f, 4.0f, 4.5f, 4.5f, 4.5f
+};
+static const float kT01sDiscD[58] = {
+    2.0f, 2.0f, 2.0f, 2.0f, 2.0f, 1.5f, 1.5f, 3.0f, 3.0f, 0.8f, 0.8f, 0.8f,
+    0.8f, 0.8f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.5f, 1.5f, 1.5f, 1.5f, 1.5f,
+    2.0f, 2.0f, 2.0f, 2.0f, 2.0f, 0.8f, 0.8f, 0.8f, 0.8f, 0.8f, 1.0f, 1.0f,
+    1.0f, 1.0f, 1.0f, 1.5f, 1.5f, 1.5f, 1.5f, 1.5f, 2.0f, 2.0f, 0.4f, 0.4f,
+    0.4f, 0.4f, 0.4f, 0.4f, 0.4f, 0.4f, 0.4f, 0.4f, 0.4f, 0.4f
+};
+static const int kT01sDiscTrunc[58] = {
+    1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0
+};
+static const int kT01sDiscAz[58] = {
+    0, 0, 0, 1, 2, 0, 0, 0, 0, 0, 1, 2,
+    3, 4, 0, 1, 2, 3, 4, 0, 1, 2, 3, 4,
+    0, 1, 2, 3, 4, 0, 1, 2, 3, 4, 0, 1,
+    2, 3, 4, 0, 1, 2, 3, 4, 0, 1, 0, 1,
+    2, 0, 1, 2, 0, 1, 2, 0, 1, 2
+};
+static const float kT01sSheetA[24] = {
+    2.0f, 2.0f, 3.0f, 3.0f, 4.0f, 4.0f, 5.0f, 5.0f, 7.0f, 7.0f, 2.0f, 2.0f,
+    3.0f, 3.0f, 4.0f, 4.0f, 5.0f, 5.0f, 7.0f, 7.0f, 3.0f, 3.0f, 5.0f, 5.0f
+};
+static const float kT01sSheetD[24] = {
+    0.4f, 0.4f, 0.4f, 0.4f, 0.4f, 0.4f, 0.4f, 0.4f, 0.4f, 0.4f, 1.2f, 1.2f,
+    1.2f, 1.2f, 1.2f, 1.2f, 1.2f, 1.2f, 1.2f, 1.2f, 0.6f, 0.6f, 0.6f, 0.6f
+};
+static const int kT01sSheetAz[24] = {
+    1, 2, 1, 2, 1, 2, 1, 2, 1, 2, 1, 2,
+    1, 2, 1, 2, 1, 2, 1, 2, 3, 4, 3, 4
+};
+static const int kT01sHarmKind[24] = {
+    0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1,
+    1, 1, 1, 2, 2, 2, 2, 2, 2, 3, 3, 3
+};
+static const float kT01sHarmP[24] = {
+    6.0f, 6.0f, 12.0f, 12.0f, 12.0f, 24.0f, 24.0f, 24.0f, 6.0f, 6.0f, 12.0f, 12.0f,
+    24.0f, 24.0f, 24.0f, 6.0f, 6.0f, 12.0f, 12.0f, 24.0f, 24.0f, 6.0f, 12.0f, 24.0f
+};
+static const float kT01sHarmR[24] = {
+    4.0f, 8.0f, 4.0f, 8.0f, 16.0f, 8.0f, 16.0f, 4.0f, 4.0f, 8.0f, 4.0f, 8.0f,
+    8.0f, 16.0f, 4.0f, 4.0f, 8.0f, 4.0f, 8.0f, 8.0f, 16.0f, 4.0f, 8.0f, 8.0f
+};
+
+static const float kT01sDeltaY = 0.01f;
+static const float kT01sRhinge = 8.0f;
+static const float kT01sWarpG  = 4.0f;
+static const float kT01sLy     = 10.0f;
+static const float kT01sHinge2 = 16.0f;
+static const float kT01sX0w    = 6.0f;
+static const float kT01sDxw    = 13.0f;
+static const float kT01sDyw    = 20.0f;
+
+// ---- the model ------------------------------------------------------------------------------
+// par[0] = sin psi, par[1] = cos psi, par[2 + m] = amplitude of mode m.
+float3 t01s_eval(StructuredBuffer<float> par, float3 p_gsm) {
+    const float sps = par[0];
+    const float cps = par[1];
+    const float tps = sps / cps;
+
+    // ---- GSM -> SM for the current-carrying modes --------------------------------------------
+    const float xs = p_gsm.x * cps - p_gsm.z * sps;
+    const float ys = p_gsm.y;
+    const float zs = p_gsm.x * sps + p_gsm.z * cps;
+
+    // ---- the warped, hinged sheet surface (T89 eq. 11) and its slopes -------------------------
+    const float hinge = xs + kT01sRhinge;
+    const float hroot = sqrt(hinge * hinge + kT01sHinge2);
+    const float y2 = ys * ys;
+    const float y4 = y2 * y2;
+    const float ly2 = kT01sLy * kT01sLy;
+    const float ly4 = ly2 * ly2;
+    const float bden = y4 + ly4;
+    const float sheet = 0.5f * tps * (hinge - hroot) - kT01sWarpG * sps * y4 / bden;
+    const float dsdx = 0.5f * tps * (1.0f - hinge / hroot);
+    const float dsdy = -kT01sWarpG * sps * 4.0f * ys * y2 * ly4 / (bden * bden);
+
+    const float zr = zs - sheet;
+    const float rho2 = xs * xs + ys * ys;
+
+    // ---- the tail truncation W(x, y) (T89 eqs. 12-13) and x W_x + y W_y -----------------------
+    const float xw = xs - kT01sX0w;
+    const float dxw2 = kT01sDxw * kT01sDxw;
+    const float wroot = sqrt(xw * xw + dxw2);
+    const float wx = 0.5f * (1.0f - xw / wroot);
+    const float dyw2 = kT01sDyw * kT01sDyw;
+    const float wy = 1.0f / (1.0f + y2 / dyw2);
+    const float wtr = wx * wy;
+    const float dwdx = wy * (-0.5f * dxw2 / (wroot * wroot * wroot));
+    const float dwdy = wx * (-2.0f * ys / dyw2) * wy * wy;
+    const float gradw = xs * dwdx + ys * dwdy;
+
+    // Accumulated in SM for the disc and sheet families, rotated to GSM once at the end; the
+    // harmonics are already GSM and go straight into bg. Summing per family rather than storing
+    // 108 vectors is what keeps this kernel inside its register budget.
+    float3 bsm = float3(0.0f, 0.0f, 0.0f);
+    float3 bg = float3(0.0f, 0.0f, 0.0f);
+
+    // ---- the disc modes ------------------------------------------------------------------------
+    [loop]
+    for (int m = 0; m < 58; ++m) {
+        const bool trunc = kT01sDiscTrunc[m] != 0;
+        const float w = trunc ? wtr : 1.0f;
+        const float gw = trunc ? gradw : 0.0f;
+        const float d = kT01sDiscD[m] + (trunc ? kT01sDeltaY * y2 : 0.0f);
+        const float ydddy = trunc ? (ys * 2.0f * kT01sDeltaY * ys) : 0.0f;
+        const float xi = sqrt(zr * zr + d * d);
+        const float u = kT01sDiscA[m] + xi;
+        const float s2 = rho2 + u * u;
+        const float s = sqrt(s2);
+        float p, pxi, pbase;
+        const int fam = kT01sDiscFam[m];
+        if (fam == 1) {
+            const float su = s + u;
+            p = 1.0f / su;
+            pxi = -1.0f / (s * su);
+            pbase = 1.0f / s;
+        } else if (fam == 2) {
+            const float su = s + u;
+            const float s3 = s2 * s;
+            p = -1.0f / (s * su);
+            pxi = 1.0f / s3;
+            pbase = -u / s3;
+        } else {
+            const float s5 = s2 * s2 * s;
+            p = 1.0f / (s2 * s);
+            pxi = -3.0f * u / s5;
+            pbase = (2.0f * u * u - rho2) / s5;
+        }
+        const float gz = -w * pxi * zr / xi;
+        const float base = w * pbase + gw * p + w * pxi * d * ydddy / xi;
+        float h, degree;
+        const int az = kT01sDiscAz[m];
+        if (az == 0)      { h = 1.0f;          degree = 0.0f; }
+        else if (az == 1) { h = ys;            degree = 1.0f; }
+        else if (az == 2) { h = xs;            degree = 1.0f; }
+        else if (az == 3) { h = xs * xs - ys * ys; degree = 2.0f; }
+        else              { h = xs * ys;       degree = 2.0f; }
+        const float bx = xs * h * gz;
+        const float by = ys * h * gz;
+        float bz = h * (base + degree * w * p);
+        bz += bx * dsdx + by * dsdy;
+        const float a = par[2 + m];
+        bsm += a * float3(bx, by, bz);
+    }
+
+    // ---- the radial-current sheet modes, in SM --------------------------------------------------
+    const float zr2 = zr * zr;
+    [loop]
+    for (int m = 0; m < 24; ++m) {
+        const float a2 = kT01sSheetA[m] * kT01sSheetA[m];
+        const float d2 = kT01sSheetD[m] * kT01sSheetD[m];
+        const float ra = rho2 + a2;
+        const float rar = sqrt(ra);
+        const float g = 1.0f / (ra * rar);
+        const float gp = -3.0f / (ra * ra * rar);
+        const float hzr = sqrt(zr2 + d2);
+        const float hz = zr / hzr;
+        const float hzp = d2 / (hzr * hzr * hzr);
+        float q, dqdx, dqdy;
+        const int az = kT01sSheetAz[m];
+        if (az == 1)      { q = ys;                 dqdx = 0.0f;      dqdy = 1.0f; }
+        else if (az == 2) { q = xs;                 dqdx = 1.0f;      dqdy = 0.0f; }
+        else if (az == 3) { q = xs * xs - ys * ys;  dqdx = 2.0f * xs; dqdy = -2.0f * ys; }
+        else              { q = xs * ys;            dqdx = ys;        dqdy = xs; }
+        const float dldx = q * (gp * xs * hz - g * hzp * dsdx) + g * hz * dqdx;
+        const float dldy = q * (gp * ys * hz - g * hzp * dsdy) + g * hz * dqdy;
+        const float a = par[2 + 58 + m];
+        bsm += a * float3(dldy, -dldx, 0.0f);
+    }
+
+    // ---- SM -> GSM: one rotation about y by the tilt --------------------------------------------
+    bg += float3(bsm.x * cps + bsm.z * sps, bsm.y, -bsm.x * sps + bsm.z * cps);
+
+    // ---- the harmonic modes, already in GSM ------------------------------------------------------
+    [loop]
+    for (int m = 0; m < 24; ++m) {
+        const float p = kT01sHarmP[m];
+        const float r = kT01sHarmR[m];
+        const float sc = 1.0f / sqrt(1.0f / (p * p) + 1.0f / (r * r));
+        const float e = exp(p_gsm.x / sc);
+        const float sy = sin(p_gsm.y / p);
+        const float cy = cos(p_gsm.y / p);
+        const float sz = sin(p_gsm.z / r);
+        const float cz = cos(p_gsm.z / r);
+        float3 b;
+        const int kind = kT01sHarmKind[m];
+        if (kind == 0)      b = float3(e * cy * sz / sc, -e * sy * sz / p, e * cy * cz / r);
+        else if (kind == 1) b = float3(sps * e * cy * cz / sc, -sps * e * sy * cz / p,
+                                       -sps * e * cy * sz / r);
+        else if (kind == 2) b = float3(e * sy * sz / sc, e * cy * sz / p, e * sy * cz / r);
+        else                b = float3(sps * e * sy * cz / sc, sps * e * cy * cz / p,
+                                       -sps * e * sy * sz / r);
+        bg += par[2 + 82 + m] * b;
+    }
+
+    // ---- the two uniform interconnection fields --------------------------------------------------
+    bg.y += par[2 + 106];
+    bg.z += par[2 + 107];
+    return bg;
+}
+
+[[vk::binding(0, 0)]] StructuredBuffer<float>   t01s_pos;
+[[vk::binding(1, 0)]] RWStructuredBuffer<float> t01s_out;
+[[vk::binding(2, 0)]] StructuredBuffer<float>   t01s_params;
+[[vk::binding(3, 0)]] StructuredBuffer<uint>    t01s_dims;
+
+[shader("compute")]
+[numthreads(256, 1, 1)]
+void irbem_t01s_f32(uint3 tid : SV_DispatchThreadID) {
+    const uint n = t01s_dims[0];
+    const uint i = tid.x;
+    if (i >= n) return;   // the grid is rounded up to a multiple of 256; the tail does nothing
+    const float3 b = t01s_eval(
+        t01s_params, float3(t01s_pos[3 * i + 0], t01s_pos[3 * i + 1], t01s_pos[3 * i + 2]));
+    t01s_out[3 * i + 0] = b.x;
+    t01s_out[3 * i + 1] = b.y;
+    t01s_out[3 * i + 2] = b.z;
+}
+
+#endif  // KERNEL_T01S

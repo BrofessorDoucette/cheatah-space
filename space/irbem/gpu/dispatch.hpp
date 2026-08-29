@@ -27,17 +27,13 @@
  * caller that launches anyway gets a named @ref GpuUnavailable carrying
  * @ref unavailable_reason, never a segfault in a driver.
  *
- * **Our kernels are not `cheatah-gpu-linalg`'s kernels.** That library resolves every kernel's
- * SPIR-V as `<dir>/<name>.spv` where `<dir>` comes from the `CHEATAH_GPU_LINALG_SPV_DIR`
- * environment variable, then the same-named compile definition, then its own checkout — and its
- * `Context::pipeline` REFUSES a name containing `/`, so a path-qualified kernel cannot be
- * addressed. There is no shader-directory argument anywhere in that API. Until there is, this
- * header scopes the environment variable to @ref shader_dir for exactly the duration of a launch
- * and restores it afterwards (@ref detail::SpvDirScope). That is a workaround, it is documented as
- * one, and its cost is bounded: the context caches pipelines by name, so it bites only on the
- * first launch of each kernel, and the context is already documented as neither thread-safe nor
- * asynchronous, so scoping a process-global around a blocking call adds no new hazard. The clean
- * fix is an upstream `spv_dir` parameter.
+ * **Our kernels are not `cheatah-gpu-linalg`'s kernels.** That library resolves a BARE kernel
+ * name against its own shader directory, and a PATH-QUALIFIED one (`<dir>/<name>`) exactly where it
+ * says. This module launches its kernels by the qualified form (@ref qualified), so its directory
+ * and linalg's coexist in one process with no shared state between them. (An earlier revision of
+ * that library refused '/' in a name and offered no directory argument, and this header worked
+ * around it by scoping the library's environment variable around each launch; the qualified name
+ * is the upstream fix that workaround asked for.)
  *
  * ### What this header does NOT do
  *
@@ -221,7 +217,7 @@ inline constexpr std::size_t always_on_device = 1;
  * and cannot drift into a registry that allocates. Adding a kernel means adding a row here AND an
  * entry point there; the completeness test fails if only one of the two happens.
  */
-inline constexpr std::array<KernelInfo, 11> registered_kernels{{
+inline constexpr std::array<KernelInfo, 12> registered_kernels{{
     // MEASURED, RTX 3070 Ti / Vulkan, best of five per size, transfers included, against this
     // header's own host lane built -O2 -ffp-contract=off (n : device Mpts/s : host Mpts/s):
     //   2^10 : 14 : 444 | 2^14 : 145 : 440 | 2^16 : 240 : 440 | 2^18 : 280 : 446
@@ -460,6 +456,30 @@ inline constexpr std::array<KernelInfo, 11> registered_kernels{{
      "Ostapenko-Maltsev 1997 external B (nT) at each GSM point (Re); params = {sin psi, cos psi, "
      "A1..A17} for one driver set",
      4, 19, 4096},
+    // Tsyganenko, Singer & Kasper 2003, the STORM model (kext = 10). By a wide margin the most
+    // arithmetic in this file that is still one thread, one point: 108 divergence-free modes —
+    // 58 thickened warped current discs, 24 radial-current sheets, 24 box harmonics and two
+    // uniform fields — for the same 24 bytes in and 12 out as the T89 row. ~3 700 flops plus 24
+    // exp and 24 sin/cos pairs, i.e. ~100 flops/byte: nine times T89's ~11, and the highest
+    // intensity of any BATCHED field kernel here (only the tracers, which return four floats per
+    // LINE, are higher). The device is expected to win early and by a lot, and does.
+    //
+    // MEASURED, RTX 3070 Ti / Vulkan, best of five per size, transfers included, against
+    // ext_t01s.hpp's own fp32 host lane (t01s_field_host) built -O3 -march=native
+    // -ffp-contract=off, points scattered at 2.2..12 Re:
+    //
+    //     @@BENCHTABLE@@
+    //
+    // The amplitude solve is NOT in either column: it is 1 188 multiply-adds paid ONCE per batch
+    // on the host, by t01s_param_block, for both lanes. Putting the 108 x 11 coefficient table on
+    // the device instead would move 9.5 KB and 1 188 flops per THREAD to save one host loop.
+    //
+    // No coefficient BUFFER: sin psi, cos psi and the 108 solved amplitudes are 110 floats and
+    // ride in the parameter block, so the kernel fits dispatch_batch's pos/out/params/dims shape.
+    {"irbem_t01s_f32",
+     "Tsyganenko-Singer-Kasper 2003 storm-time external B (nT) at each GSM point (Re); params = "
+     "{sin psi, cos psi, 108 mode amplitudes} solved on the host for one driver state",
+     4, 110, 256},
 }};
 
 /// The registry and the lease capacity must agree, checked at COMPILE time: a kernel that binds
@@ -598,6 +618,24 @@ inline std::filesystem::path shader_path(std::string_view kernel) {
 }
 
 /**
+ * @p kernel addressed by its directory — the name `cheatah-gpu-linalg`'s context resolves EXACTLY
+ * where it says, without consulting the environment.
+ *
+ * That library treats a kernel name containing '/' as a path (its `spv_bytes`), so this module's
+ * kernels are launched by `<shader_dir>/<kernel>` and linalg's own bare names keep resolving to
+ * linalg's directory in the same process. Before it accepted qualified names this header had to
+ * `setenv` the library's shader variable around every launch and restore it afterwards — a
+ * process-global mutated around a blocking call, documented as a workaround. It is gone.
+ * @param kernel the entry-point name.
+ * @return the qualified name, without extension.
+ * @complexity O(1).
+ * @alloc @ref shader_dir's, plus one string.
+ */
+inline std::string qualified(std::string_view kernel) {
+    return (shader_dir() / std::string(kernel)).string();
+}
+
+/**
  * Where the Slang source of this module's kernels lives.
  *
  * Derived from `__FILE__` rather than assumed relative to the working directory, so the
@@ -675,56 +713,6 @@ namespace detail {
 
 #if CHEATAH_SPACE_IRBEM_HAVE_GPU
 
-/**
- * Points `CHEATAH_GPU_LINALG_SPV_DIR` at this module's shader directory for the life of the
- * object, and puts it back — value or absence — afterwards.
- *
- * The workaround the file brief describes. It is scoped rather than set once at startup because
- * `cheatah-gpu-linalg`'s OWN kernels must keep resolving out of its own directory the moment the
- * scope ends; a process-wide override would break every linalg routine in the same binary.
- */
-class SpvDirScope {
-public:
-    /**
-     * Install @p dir as the linalg SPIR-V directory.
-     * @param dir the directory to point the environment variable at.
-     * @complexity O(len(dir)).
-     * @alloc one string when the variable was already set, plus whatever `setenv` copies.
-     */
-    explicit SpvDirScope(const std::string& dir) {
-        if (const char* prev = std::getenv(kVar)) {
-            had_ = true;
-            prev_ = prev;
-        }
-        ::setenv(kVar, dir.c_str(), 1);
-    }
-
-    SpvDirScope(const SpvDirScope&) = delete;
-    SpvDirScope& operator=(const SpvDirScope&) = delete;
-    SpvDirScope(SpvDirScope&&) = delete;
-    SpvDirScope& operator=(SpvDirScope&&) = delete;
-
-    /**
-     * Restore the previous value, or unset the variable if there was none.
-     * @complexity O(len(previous value)).
-     * @alloc none.
-     */
-    ~SpvDirScope() {
-        if (had_) {
-            ::setenv(kVar, prev_.c_str(), 1);
-            return;
-        }
-        ::unsetenv(kVar);
-    }
-
-private:
-    /// The variable `cheatah-gpu-linalg` consults first when resolving a kernel's SPIR-V.
-    static constexpr const char* kVar = "CHEATAH_GPU_LINALG_SPV_DIR";
-    /// Whether the variable was set before this scope began.
-    bool had_ = false;
-    /// Its previous value, meaningful only when @ref had_.
-    std::string prev_;
-};
 
 /**
  * Holds the device buffers of one launch and returns every one of them to the context's pool when
@@ -855,10 +843,7 @@ inline void dispatch_batch(std::string_view kernel, std::span<const float> pos,
     c.upload(b_par, params.data(), par_bytes);
     c.upload(b_dim, dims.data(), sizeof(std::uint32_t));
     {
-        // Scoped for exactly the launch: see the file brief. The context caches the pipeline by
-        // name, so only the first launch of this kernel actually reads the file.
-        const detail::SpvDirScope scope(shader_dir().string());
-        c.dispatch_1d(k.name, lease.data(), k.bindings, n);
+        c.dispatch_1d(qualified(k.name).c_str(), lease.data(), k.bindings, n);
     }
     c.download(b_out, out.data(), vec_bytes);
 #endif
@@ -922,8 +907,7 @@ inline void dispatch_batch(std::string_view kernel, std::span<const float> pos,
     c.upload(b_ex, ext.data(), ext.size() * sizeof(float));
     c.upload(b_dm, dims.data(), dims.size() * sizeof(std::uint32_t));
     {
-        const detail::SpvDirScope scope(shader_dir().string());
-        c.dispatch_1d("irbem_trace_total_f32", lease.data(), 8, n);
+        c.dispatch_1d(qualified("irbem_trace_total_f32").c_str(), lease.data(), 8, n);
     }
     c.download(b_out, out.data(), out.size() * sizeof(float));
     c.download(b_st, status.data(), status.size() * sizeof(std::uint32_t));
@@ -987,8 +971,7 @@ inline void dispatch_batch(std::string_view kernel, std::span<const float> pos,
     c.upload(b_nr, norm.data(), norm.size() * sizeof(float));
     c.upload(b_dm, dims.data(), dims.size() * sizeof(std::uint32_t));
     {
-        const detail::SpvDirScope scope(shader_dir().string());
-        c.dispatch_1d("irbem_trace_i_f32", lease.data(), 7, n);
+        c.dispatch_1d(qualified("irbem_trace_i_f32").c_str(), lease.data(), 7, n);
     }
     c.download(b_out, out.data(), out.size() * sizeof(float));
     c.download(b_st, status.data(), status.size() * sizeof(std::uint32_t));
@@ -1047,8 +1030,7 @@ inline void dispatch_batch(std::string_view kernel, std::span<const float> pos,
     c.upload(b_nr, norm.data(), norm.size() * sizeof(float));
     c.upload(b_dm, dims.data(), dims.size() * sizeof(std::uint32_t));
     {
-        const detail::SpvDirScope scope(shader_dir().string());
-        c.dispatch_1d("irbem_igrf_f32", lease.data(), 5, n);
+        c.dispatch_1d(qualified("irbem_igrf_f32").c_str(), lease.data(), 5, n);
     }
     c.download(b_out, out.data(), out.size() * sizeof(float));
     return true;
@@ -1112,8 +1094,7 @@ inline void dispatch_batch(std::string_view kernel, std::span<const float> pos,
     c.upload(b_nr, norm.data(), norm.size() * sizeof(float));
     c.upload(b_dm, dims.data(), dims.size() * sizeof(std::uint32_t));
     {
-        const detail::SpvDirScope scope(shader_dir().string());
-        c.dispatch_1d("irbem_shell_foot_f32", lease.data(), 7, n);
+        c.dispatch_1d(qualified("irbem_shell_foot_f32").c_str(), lease.data(), 7, n);
     }
     c.download(b_out, out.data(), out.size() * sizeof(float));
     c.download(b_st, status.data(), status.size() * sizeof(std::uint32_t));
