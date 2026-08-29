@@ -1,0 +1,50 @@
+# 03_plot_omni_imf — the whole story: open a NASA CDF, decode two variables into ndarrays, and
+# plot one against the other with cheatah-plot. Writes out/03_plot_omni_imf.png.
+#
+# The file is OMNI's MONTHLY 1-minute product: 44640 records is 744 hours, i.e. all of January
+# 2015 — not one day, which is what a "20150101" filename first suggests.
+#
+# Two things worth copying from here. Epoch is rebased to hours since the start of the day
+# because cheatah-plot has no time axis — its ticks format as "%.6g", so a raw CDF_EPOCH of
+# 6.3587e13 ms would render as one indistinguishable label repeated across the axis. And the
+# fill values are replaced rather than plotted: OMNI marks a missing sample as ~1e31, which
+# would flatten every real variation into a horizontal line at the bottom of the frame.
+import io
+import os
+import ndarray
+import space.cdf as cdf
+import plot
+import plot.figure as figure
+
+let path = "../../space/cdf/vendor/corpus/tier1/omni_hro2_1min_20150101_v01.cdf"
+if os.path.exists(path) == false {
+    io.print("corpus absent — run: scripts/cdf-corpus.sh fetch --tier 1")
+} else {
+    let f = cdf.open(path)
+    let t = cdf.values(f, "Epoch")        # CDF_EPOCH: milliseconds since year 0
+    let b = cdf.values(f, "F")            # IMF magnitude, nT
+    let n = ndarray.size_of(b)
+
+    # Keep only the samples that are real, rebasing time onto hours from the first one.
+    let hours = ndarray.zeros([n])
+    let field = ndarray.zeros([n])
+    let t0 = t[0]
+    let k = 0
+    for i in range(n) {
+        if b[i] < 1000.0 {
+            hours[k] = (t[i] - t0) / 3600000.0
+            field[k] = b[i]
+            k = k + 1
+        }
+    }
+    let x = hours[0:k]
+    let y = field[0:k]
+
+    let fig = figure.line(figure.new_figure(), x, y)
+    fig = figure.title(fig, "OMNI interplanetary magnetic field, January 2015")
+    fig = figure.xlabel(fig, "hours since 2015-01-01T00:00:00Z")
+    fig = figure.ylabel(fig, "|B| (nT)")
+    fig = figure.size(fig, 1280, 720)
+    plot.save(fig, "out/03_plot_omni_imf.png")
+    io.print("plotted", k, "samples -> out/03_plot_omni_imf.png")
+}

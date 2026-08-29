@@ -6,6 +6,55 @@ alongside the other cheatah extensions.
 
 ## Unreleased
 
+### space.cdf — reads real NASA CDF files into ndarrays
+
+`space.cdf` opens a CDF 3.x file and hands its variables back as cheatah `ndarray`s, GZIP
+included. That is the whole of this tranche's goal: the flow from a file on disk to a plot.
+
+```purr
+let f = cdf.open("omni_hro2_1min_20150101_v01.cdf")
+let b = cdf.values(f, "F")                  # ndarray[float64], IMF magnitude in nT
+let fig = figure.line(figure.new_figure(), hours, b)
+plot.save(fig, "out/omni_imf.png")
+```
+
+- **The reader** — `open`, `var_names`, `record_count`, `data_type_name`, `shape`, `values`,
+  `values_i64`. A `File` is immutable after open, so it copies cheaply and any number of threads
+  may read one. Records are decoded in a single pass straight into the ndarray's buffer.
+- **Nine headers**: the format vocabulary, one bounds-checked byte reader, mmap behind a testable
+  syscall seam, the internal records, the VXR index walk, the decode kernels, DEFLATE, and the
+  leap-second table. All at 100% lines and functions.
+- **DEFLATE from scratch** (RFC 1951), no zlib. GZIP is the only compression that occurs in
+  NASA's public archive, so this is what turns "opens OMNI" into "opens RBSP, MMS and THEMIS".
+- **`examples/purr_space/`** — three runnable programs ending in a rendered PNG, plus a runner
+  that skips cleanly without the toolchain, cheatah-plot, or the corpus.
+
+**Verified against bytes NASA produced, not against our own opinion of them.** The expected
+values were decoded by hand from the OMNI byte stream before the reader existed: `F` opens
+6.92 / 5.84 / 5.71 nT and `Epoch` at 63587289600000.0 ms. And `test_alltypes.cdf` carries
+`Longitude` (GZIP level 9) beside `longitude_copy` (uncompressed) holding the same values — they
+now agree value for value, which says our inflate agrees with the encoder NASA's writer used.
+
+Four things learned the hard way, recorded so they are not rediscovered:
+
+- **The VXR index describes allocation, not truth.** OMNI's `Epoch` index ends at record 45055
+  while `maxRec` is 44639, because VVRs are allocated at blocking-factor granularity. A reader
+  that trusts the index hands back 416 records of uninitialised slack.
+- **The index is a multi-level tree with sibling chains** in the very first real file opened —
+  a naive VXR→VVR walk fails immediately. The walk is iterative and capped on depth and node
+  count, because one byte makes `VXRnext` point at itself.
+- **CDF's fields are unaligned by construction**, so every multi-byte load is `memcpy` + `bswap`
+  rather than a cast to a wider pointer, which is undefined behaviour with UBSan in the gate.
+- **A guard before a switch can make the arms it guards unreachable** — and an arm no
+  instantiation can enter is a line no test can cover. The lossless-conversion refusals live
+  inside the decode arms for exactly that reason.
+
+Deferred, and refused by name rather than guessed at: CDF 2.x, whole-file compression,
+multi-file CDFs, VAX floats, sparse records with gaps, RLE/Huffman/adaptive Huffman, column-major
+N-D variables, the attributes API, the writer, the checksum, signing, and the byte-for-byte
+differential harness. The three legacy codecs are last on purpose: the specification names them
+but never documents their bitstreams, and no file in the archive uses any of them.
+
 ### space.irbem — four external field models, and a vectorised CPU lane
 
 `kext=1` Mead & Fairfield (1975), `kext=5` Olson-Pfitzer quiet (1977), `kext=6` Olson-Pfitzer

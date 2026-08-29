@@ -383,6 +383,29 @@ inline std::vector<long long> shape(const File& f, const std::string& name) {
  * let b = cdf.values(f, "F")            # IMF magnitude, nT, one value per minute
  * io.print(b[0], b[1], b[2])            # 6.92 5.84 5.71
  * @endcode
+ *
+ * @par Example
+ * The whole point of returning an ndarray: it goes straight into cheatah-plot.
+ * @code{.purr}
+ * import ndarray
+ * import space.cdf as cdf
+ * import plot
+ * import plot.figure as figure
+ *
+ * let f = cdf.open("omni_hro2_1min_20150101_v01.cdf")
+ * let t = cdf.values(f, "Epoch")
+ * let b = cdf.values(f, "F")
+ *
+ * # Rebase onto hours: cheatah-plot has no time axis, and a raw CDF_EPOCH of 6.3e13 ms would
+ * # render as one repeated tick label.
+ * let n = ndarray.size_of(b)
+ * let hours = ndarray.zeros([n])
+ * for i in range(n) { hours[i] = (t[i] - t[0]) / 3600000.0 }
+ *
+ * let fig = figure.line(figure.new_figure(), hours, b)
+ * fig = figure.ylabel(fig, "|B| (nT)")
+ * plot.save(fig, "omni_imf.png")
+ * @endcode
  */
 inline ::cheatah::ndarray::basic_ndarray<double> values(const File& f, const std::string& name) {
     return detail::read_values<double>(f, name);

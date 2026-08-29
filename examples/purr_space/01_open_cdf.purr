@@ -1,0 +1,17 @@
+# 01_open_cdf — open a NASA CDF and describe what is inside it.
+import io
+import os
+import space.cdf as cdf
+
+let path = "../../space/cdf/vendor/corpus/tier1/omni_hro2_1min_20150101_v01.cdf"
+if os.path.exists(path) == false {
+    io.print("corpus absent — run: scripts/cdf-corpus.sh fetch --tier 1")
+} else {
+    let f = cdf.open(path)
+    let names = cdf.var_names(f)
+    io.print("variables:", len(names))
+    for i in range(6) {
+        let n = names[i]
+        io.print("  ", n, cdf.data_type_name(f, n), "records:", cdf.record_count(f, n))
+    }
+}

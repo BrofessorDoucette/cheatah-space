@@ -1,0 +1,33 @@
+# 02_cdf_to_ndarray — pull two variables out of a CDF as ndarrays and do arithmetic on them.
+#
+# `values` hands back float64, which is what the numeric stack and cheatah-plot both want.
+# Integer-exact types (CDF_INT8, CDF_TIME_TT2000) come back through `values_i64` instead — a
+# double cannot hold them without loss, so asking for one is an error rather than a rounding.
+import io
+import os
+import ndarray
+import space.cdf as cdf
+
+let path = "../../space/cdf/vendor/corpus/tier1/omni_hro2_1min_20150101_v01.cdf"
+if os.path.exists(path) == false {
+    io.print("corpus absent — run: scripts/cdf-corpus.sh fetch --tier 1")
+} else {
+    let f = cdf.open(path)
+    let b = cdf.values(f, "F")            # IMF magnitude, nT, one sample per minute
+    io.print("F: ", ndarray.size_of(b), "values")
+    io.print("first three:", b[0], b[1], b[2])
+
+    # OMNI marks missing samples with a fill value near 1e31, so a plain mean is meaningless
+    # until they are dropped — the arithmetic below is why the data comes back as an ndarray.
+    let n = ndarray.size_of(b)
+    let total = 0.0
+    let good = 0
+    for i in range(n) {
+        if b[i] < 1000.0 {
+            total = total + b[i]
+            good = good + 1
+        }
+    }
+    io.print("valid samples:", good, "of", n)
+    io.print("mean |B|:", total / float(good), "nT")
+}

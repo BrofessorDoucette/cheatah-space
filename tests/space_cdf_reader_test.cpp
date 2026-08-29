@@ -79,6 +79,9 @@ TEST(CdfReader, OmniOpensAndDecodesTheHandVerifiedValues) {
     ASSERT_EQ(t.size(), 44640u);
     EXPECT_EQ(flat(t)[0], 63587289600000.0);   // 2015-01-01T00:00:00Z as CDF_EPOCH ms
     EXPECT_EQ(flat(t)[1] - flat(t)[0], 60000.0);              // one-minute cadence
+    // 44640 one-minute samples is 744 hours — the whole of January 2015. The "20150101"
+    // in the filename is the month's first day, not the extent of the file.
+    EXPECT_EQ(cdf::record_count(f, "Epoch"), 31 * 24 * 60);
     EXPECT_EQ(flat(t)[44639] - flat(t)[0], 44639 * 60000.0);
 
     EXPECT_EQ(code_of([&] { (void)cdf::values(f, "no_such_variable"); }), cdf::ErrorCode::VariableNotFound);

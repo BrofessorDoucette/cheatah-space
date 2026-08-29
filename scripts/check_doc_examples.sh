@@ -28,8 +28,23 @@ PURRC="$(find_tool purrc)"
 [ -n "$PURRC" ] && [ -x "$PURRC" ] || {
     echo "doc-examples: no purrc toolchain (set CHEATAH_DIR or place cheatah at ../cheatah)"; exit 2; }
 
+# The repo's own root resolves `space`; cheatah-plot's resolves `plot`, so an example may end in
+# plot.save(...) and still be gate-compiled here. It is OPTIONAL by design: a checkout without the
+# sibling still passes, it simply proves less. Making it mandatory would fail a fresh clone, and a
+# gate that fails on a fresh clone is one people learn to bypass with --no-verify — which loses
+# every other check too, not just this one.
+IMPORT_ROOTS=(--import-root "$REPO")
+HAVE_PLOT=0
+PLOT_DIR="${CHEATAH_PLOT_DIR:-$(cd "$REPO/../cheatah-plot" 2>/dev/null && pwd || true)}"
+if [ -n "$PLOT_DIR" ] && [ -f "$PLOT_DIR/plot/plot.hpp" ]; then
+    IMPORT_ROOTS+=(--import-root "$PLOT_DIR")
+    HAVE_PLOT=1
+else
+    echo "doc-examples: cheatah-plot not found — examples that import it are SKIPPED (set CHEATAH_PLOT_DIR to check them)."
+fi
+
 W="$(mktemp -d)"; trap 'rm -rf "$W"' EXIT
-total=0; failed=0
+total=0; failed=0; skipped=0
 
 for src in space/space.hpp space/*/*.hpp space/*/*/*.hpp; do
     [ -f "$src" ] || continue
@@ -60,8 +75,14 @@ while IFS= read -r line; do
             : > "$body"
             ;;
         ENDBLOCK)
+            # An example that plots needs the sibling checkout. Without it the block is skipped,
+            # not failed: cheatah-space has no dependency on cheatah-plot and must build alone.
+            if [ "$HAVE_PLOT" = "0" ] && grep -q '^import plot' "$body"; then
+                skipped=$((skipped + 1))
+                continue
+            fi
             total=$((total + 1))
-            if ! out="$("$PURRC" --import-root "$REPO" "$body" -o "$W/ex.so" 2>&1)"; then
+            if ! out="$("$PURRC" "${IMPORT_ROOTS[@]}" "$body" -o "$W/ex.so" 2>&1)"; then
                 failed=$((failed + 1))
                 echo "doc-examples: FAILED — $block_file:$block_line does not compile:"
                 echo "$out" | sed 's/^/    /' | head -12
@@ -77,4 +98,6 @@ if [ "$total" -eq 0 ]; then
     exit 1
 fi
 [ "$failed" -eq 0 ] || { echo "doc-examples: $failed of $total example blocks failed."; exit 1; }
-echo "doc-examples: all $total example blocks compile."
+note=""
+[ "$skipped" -gt 0 ] && note=" ($skipped skipped: no cheatah-plot)"
+echo "doc-examples: all $total example blocks compile$note."

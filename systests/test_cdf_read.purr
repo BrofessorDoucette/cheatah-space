@@ -21,7 +21,8 @@ if os.path.exists(path) == false {
     let file = cdf.open(path)
     f += check.int_eq("47 variables", len(cdf.var_names(file)), 47)
     f += check.is_true("first variable is Epoch", cdf.var_names(file)[0] == "Epoch")
-    f += check.int_eq("F has 44640 records", cdf.record_count(file, "F"), 44640)
+    # 44640 one-minute samples = 744 hours = all of January 2015, not a single day.
+    f += check.int_eq("F has a month of minutes", cdf.record_count(file, "F"), 31 * 24 * 60)
     f += check.is_true("F is CDF_REAL4", cdf.data_type_name(file, "F") == "CDF_REAL4")
     f += check.int_eq("F shape is [44640]", cdf.shape(file, "F")[0], 44640)
 
