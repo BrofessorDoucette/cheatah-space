@@ -50,6 +50,7 @@ add_executable(cheatah_space_tests
     space_cdf_leapseconds_test.cpp
     space_cdf_format_test.cpp
     space_cdf_records_test.cpp
+    space_cdf_reader_test.cpp
     space_cdf_mapping_test.cpp
     irbem_frames_test.cpp
     irbem_policy_test.cpp
@@ -64,6 +65,11 @@ add_executable(cheatah_space_tests
     irbem_field_test.cpp
     irbem_field_hostpaths_test.cpp
     irbem_t89_test.cpp
+    irbem_mead_test.cpp
+    irbem_opq_test.cpp
+    irbem_opd_test.cpp
+    irbem_ostapenko_test.cpp
+    irbem_batch_simd_test.cpp
     irbem_trace_api_test.cpp
     irbem_driftshell_test.cpp
     irbem_total_field_test.cpp
