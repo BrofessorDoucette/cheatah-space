@@ -95,6 +95,7 @@
 #include "space/irbem/ext_t89.hpp"
 #include "space/time/calendar.hpp"
 #include "space/irbem/gpu/dispatch.hpp"
+#include "space/irbem/batch_soa.hpp"
 #include "space/irbem/igrf.hpp"
 #include "space/irbem/lstar.hpp"
 
@@ -2050,6 +2051,33 @@ void BM_cpu_igrf_batch(benchmark::State& state) {
 }
 BENCHMARK(BM_cpu_igrf_batch)->Unit(benchmark::kMillisecond)->UseRealTime();
 
+/// `igrf_batch_host` over the same batch — the SIMD strip lane of batch_soa.hpp, i.e. what
+/// `field_batch`'s host path now runs. Same points, same model, same fp64 answers to the bit
+/// (IrbemBatchSimd.BatchLaneIsBitIdenticalToTheScalarLane); the ratio to `BM_cpu_igrf_batch` is
+/// the whole claim of that header, and it is measured here rather than quoted. The output spans
+/// are sized once at start-up; the timed region allocates nothing.
+/// @param state the benchmark state.
+/// @complexity O(kIgrfBatch) evaluations per iteration, each O(NMAX^2), eight per strip.
+/// @alloc none inside the loop.
+void BM_cpu_igrf_batch_soa(benchmark::State& state) {
+    const Inputs& in = inputs();
+    const IgrfBatch& b = igrf_batch();
+    const Igrf<13>& model = *in.igrf13;
+    static std::vector<FieldVector<Frame::GEO>> out(kIgrfBatch);
+    static std::vector<double> mag(kIgrfBatch);
+    for (auto _ : state) {
+        const Position<Frame::GEO>* p = opaque(b.geo64.data());
+        Status s = igrf_batch_host(model, std::span<const Position<Frame::GEO>>(p, kIgrfBatch),
+                                   std::span<FieldVector<Frame::GEO>>(out), std::span<double>(mag));
+        benchmark::DoNotOptimize(s);
+        benchmark::DoNotOptimize(out.data());
+        benchmark::DoNotOptimize(mag.data());
+        benchmark::ClobberMemory();
+    }
+    set_points(state, kIgrfBatch);
+}
+BENCHMARK(BM_cpu_igrf_batch_soa)->Unit(benchmark::kMillisecond)->UseRealTime();
+
 #ifdef CHEATAH_SPACE_IRBEM_LSTAR_GPU
 /// Launch `irbem_igrf_f32` over the staged batch, through `dispatch.hpp`'s own `launch_igrf`.
 ///
@@ -2115,7 +2143,7 @@ struct Routine {
 };
 
 /// Every routine the table reports, in the order it reports them.
-constexpr std::array<Routine, 47> kRoutines{{
+constexpr std::array<Routine, 48> kRoutines{{
     {"datetime: julian_day_number", "BM_cpu_julian_day_number", nullptr, "BM_irbem_julday", nullptr},
     {"datetime: calendar_date", "BM_cpu_calendar_date", nullptr, "BM_irbem_caldat", nullptr},
     {"datetime: day_of_year", "BM_cpu_day_of_year", nullptr, "BM_irbem_get_doy", nullptr},
@@ -2169,6 +2197,8 @@ constexpr std::array<Routine, 47> kRoutines{{
     {"igrf: evaluate, batch of 65536", "BM_cpu_igrf_batch/real_time",
      "BM_gpu_igrf_batch/real_time",
      "BM_irbem_get_field_igrf", "irbem_igrf_f32"},
+    {"igrf: batch of 65536, SIMD strips (field_batch host lane)",
+     "BM_cpu_igrf_batch_soa/real_time", nullptr, "BM_irbem_get_field_igrf", nullptr},
     {"dipole: batch, fp32", "BM_cpu_dipole_field_host_batch/real_time", "BM_gpu_dipole_field_batch/real_time",
      "BM_irbem_get_field_dipole", "irbem_dipole_f32"},
 

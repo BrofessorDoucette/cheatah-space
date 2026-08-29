@@ -1105,3 +1105,382 @@ void irbem_trace_total_f32(uint3 tid : SV_DispatchThreadID) {
 }
 
 #endif  // KERNEL_TRACE_TOTAL
+
+// =============================================================================================
+// irbem_opd_f32 — the Olson-Pfitzer DYNAMIC external field (kext = 6), one thread per point.
+//
+// The documented structure of the 1988 model, as space/irbem/ext_opd.hpp states and cites it:
+//
+//     B(r) = s^3 * B_q(s r) + C * R(r)
+//
+// a quiet field compressed self-similarly by s = (P / P_0)^(1/6), plus a flat symmetric ring
+// current in the dipole equator whose amplitude C is the pressure-corrected Dst's departure from
+// quiet. The quiet field is the SHARED t89_eval on the scaled position — the parameter buffer's
+// first thirty floats are exactly the T89 layout for the quietest published set — and the ring is
+// the A^(3) disc of Tsyganenko (1989) eq. (9), unwarped, evaluated in SM and rotated back. This
+// mirrors ext_opd.hpp's opd_components<float> expression for expression, so a disagreement between
+// the two lanes is attributable to the DEVICE.
+//
+// bindings: 0 pos (3N floats, GSM, Re) | 1 out (3N floats, nT, GSM)
+//           2 params (32 floats: [0..29] the T89 quiet block as t89_eval reads it —
+//                     sin psi, cos psi, C1..C19, dx, a_rc, D0, gamma_rc, Rc, G, a_T, Dy, x0 —
+//                     then [30] s, [31] C)
+//           3 dims {N}
+// =============================================================================================
+#ifdef KERNEL_OPD
+
+[[vk::binding(0, 0)]] StructuredBuffer<float>   opd_pos;
+[[vk::binding(1, 0)]] RWStructuredBuffer<float> opd_out;
+[[vk::binding(2, 0)]] StructuredBuffer<float>   opd_params;
+[[vk::binding(3, 0)]] StructuredBuffer<uint>    opd_dims;
+
+/// The Dst-driven ring per unit amplitude: Tsyganenko (1989) eqs. (16)-(17) with z_s = 0 and a
+/// constant thickness, so every slope term of the published form is identically zero. Radius and
+/// half-thickness are the quiet set's a_RC and D_0, read from the T89 block.
+float3 opd_ring_unit(StructuredBuffer<float> par, float3 p) {
+    const float sps = par[0];
+    const float cps = par[1];
+    const float a = par[22];
+    const float d = par[23];
+    const float xs = p.x * cps - p.z * sps;
+    const float ys = p.y;
+    const float zs = p.x * sps + p.z * cps;
+    const float rho2 = xs * xs + ys * ys;
+    const float xi = sqrt(zs * zs + d * d);
+    const float u = a + xi;
+    const float S = sqrt(rho2 + u * u);
+    const float S2 = S * S;
+    const float S5 = S2 * S2 * S;
+    const float q = 3.0f * u / (xi * S5);
+    const float bxsm = q * xs * zs;
+    const float bysm = q * ys * zs;
+    const float bzsm = (2.0f * u * u - rho2) / S5;
+    return float3(bxsm * cps + bzsm * sps, bysm, -bxsm * sps + bzsm * cps);
+}
+
+[shader("compute")]
+[numthreads(256, 1, 1)]
+void irbem_opd_f32(uint3 tid : SV_DispatchThreadID) {
+    const uint n = opd_dims[0];
+    const uint i = tid.x;
+    if (i >= n) return;   // the grid is rounded up to a multiple of 256; the tail does nothing
+    const float s = opd_params[30];
+    const float c = opd_params[31];
+    const float s3 = s * s * s;
+    const float3 p = float3(opd_pos[3 * i + 0], opd_pos[3 * i + 1], opd_pos[3 * i + 2]);
+    const float3 quiet = t89_eval(opd_params, float3(s * p.x, s * p.y, s * p.z));
+    const float3 ring = opd_ring_unit(opd_params, p);
+    opd_out[3 * i + 0] = s3 * quiet.x + c * ring.x;
+    opd_out[3 * i + 1] = s3 * quiet.y + c * ring.y;
+    opd_out[3 * i + 2] = s3 * quiet.z + c * ring.z;
+}
+
+#endif  // KERNEL_OPD
+
+// =============================================================================================
+// irbem_mead_f32 — Mead & Fairfield (1975) external field, one thread per point.
+//
+// PHYSICS. Mead & Fairfield, J. Geophys. Res. 80(4):523 (1975): the external field as a quadratic
+// in the ABERRATED solar-magnetic position and a linear function of the dipole tilt in DEGREES,
+// four Kp-binned coefficient sets (the paper's Tables 2-3). With (xm, ym, z) the SM position
+// rotated about the dipole axis by the 4-degree mean solar-wind aberration and t the tilt in
+// degrees:
+//
+//     Bx = a1 z + a2 xm z + t (a3 + a4 xm + a5 xm^2 + a6 ym^2 + a7 z^2)
+//     By = b1 ym z + t (b2 ym + b3 xm ym)
+//     Bz = c1 + c2 xm + c3 xm^2 + c4 ym^2 + c5 z^2 + t (c6 z + c7 xm z)
+//
+// The aberration rotates the POSITION only; the components come out in SM and are rotated back
+// to GSM by the tilt alone — the file brief of space/irbem/ext_mead.hpp carries the oracle
+// experiment that establishes this. About 50 flops: no loop, no branch, no transcendental.
+//
+// This mirrors ext_mead.hpp's mead_components<float> expression for expression, so a
+// disagreement between the two is attributable to the DEVICE and not to the arithmetic having
+// been written differently on the two sides.
+//
+// bindings: 0 pos (3N floats, GSM, Re) | 1 out (3N floats, nT, GSM)
+//           2 params (20 floats: sin psi, cos psi, psi in degrees, a1..a7, b1..b3, c1..c7)
+//           3 dims {N}
+// =============================================================================================
+
+// sin(4 deg) and cos(4 deg), the one parameter the paper fixed — the same literals ext_mead.hpp
+// carries, rounded to float here exactly as its float lane rounds them.
+static const float kMeadAbSin = 0.0697564737441253f;
+static const float kMeadAbCos = 0.9975640502598242f;
+
+/// The Mead-Fairfield external field at a GSM point, in nT. Shared with any future total-field
+/// tracer the way t89_eval is, so the physics exists in this file exactly once. Parameter layout
+/// per the block comment above.
+float3 mead_eval(StructuredBuffer<float> par, float3 p_gsm) {
+    const float sps = par[0];
+    const float cps = par[1];
+    const float t   = par[2];
+
+    // ---- GSM -> SM: one rotation about y by the tilt -----------------------------------------
+    const float xs = p_gsm.x * cps - p_gsm.z * sps;
+    const float ys = p_gsm.y;
+    const float zs = p_gsm.x * sps + p_gsm.z * cps;
+
+    // ---- the aberrated position: SM rotated about the dipole axis by 4 degrees ---------------
+    const float xm = xs * kMeadAbCos - ys * kMeadAbSin;
+    const float ym = xs * kMeadAbSin + ys * kMeadAbCos;
+
+    // ---- the three polynomials, in SM components ---------------------------------------------
+    const float xm2 = xm * xm;
+    const float ym2 = ym * ym;
+    const float zs2 = zs * zs;
+    const float bx_sm = par[3] * zs + par[4] * xm * zs
+                      + t * (par[5] + par[6] * xm + par[7] * xm2 + par[8] * ym2 + par[9] * zs2);
+    const float by_sm = par[10] * ym * zs + t * (par[11] * ym + par[12] * xm * ym);
+    const float bz_sm = par[13] + par[14] * xm + par[15] * xm2 + par[16] * ym2 + par[17] * zs2
+                      + t * (par[18] * zs + par[19] * xm * zs);
+
+    // ---- SM -> GSM ----------------------------------------------------------------------------
+    return float3(bx_sm * cps + bz_sm * sps, by_sm, -bx_sm * sps + bz_sm * cps);
+}
+
+#ifdef KERNEL_MEAD
+
+[[vk::binding(0, 0)]] StructuredBuffer<float>   mead_pos;
+[[vk::binding(1, 0)]] RWStructuredBuffer<float> mead_out;
+[[vk::binding(2, 0)]] StructuredBuffer<float>   mead_params;
+[[vk::binding(3, 0)]] StructuredBuffer<uint>    mead_dims;
+
+[shader("compute")]
+[numthreads(256, 1, 1)]
+void irbem_mead_f32(uint3 tid : SV_DispatchThreadID) {
+    const uint n = mead_dims[0];
+    const uint i = tid.x;
+    if (i >= n) return;   // the grid is rounded up to a multiple of 256; the tail does nothing
+    const float3 b = mead_eval(mead_params,
+                               float3(mead_pos[3 * i + 0], mead_pos[3 * i + 1], mead_pos[3 * i + 2]));
+    mead_out[3 * i + 0] = b.x;
+    mead_out[3 * i + 1] = b.y;
+    mead_out[3 * i + 2] = b.z;
+}
+
+#endif  // KERNEL_MEAD
+
+// =============================================================================================
+// Olson & Pfitzer (1977) quiet-time external field, as a SHARED function.
+//
+// Declared outside every kernel guard and taking its parameter buffer as an argument, for the
+// same reason igrf_eval and t89_eval are: one implementation of the physics on the device, so a
+// tracer that later composes it evaluates the same series the batched kernel does.
+//
+// The model is the report's subroutine BXYZMU (Olson & Pfitzer, AFOSR F44620-75-C-0033, 1977,
+// pp. 64-67): a power series in SOLAR-MAGNETIC position through fifth order with an
+// exp(-0.06 r^2) envelope, its coefficients already folded for the epoch's tilt ON THE HOST
+// (the fold is a cubic in the tilt in degrees; a batch shares one epoch, so folding per thread
+// would be 172 redundant pairs per point). Three radial rules from the report: zero inside 2 Re,
+// a linear-in-r^2 taper to 2.5 Re, and the zero template beyond 15 Re. The enumeration of the
+// 32 + 22 + 32 terms is the report's own loop with its two truncation counters, mirrored
+// statement for statement from space/irbem/ext_opq.hpp's opq_components<float>, so that a
+// device-vs-host disagreement is attributable to the DEVICE and not to the arithmetic having
+// been written differently on the two sides.
+//
+// The parameter layout is the one opq_param_block stages: [0]=sin(tilt) [1]=cos(tilt),
+// [2..33]=A(32), [34..65]=B(32), [66..87]=C(22), [88..109]=D(22), [110..141]=E(32),
+// [142..173]=F(32) — 174 floats. The kernel takes GSM in, rotates about y by the tilt into SM,
+// evaluates, and rotates the field back.
+//
+// bindings: 0 pos (3N floats, GSM, Re) | 1 out (3N floats, nT, GSM)
+//           2 params (174 floats, as above) | 3 dims {N}
+// =============================================================================================
+
+static const float kOpqExpRate    = 0.06f;    // exp(-0.06 r^2), report p. 67
+static const float kOpqInnerR2    = 4.0f;     // zero inside 2 Re, report p. 66
+static const float kOpqTaperR2    = 6.25f;    // linear taper to 2.5 Re
+static const float kOpqTemplateR2 = 225.0f;   // the zero template beyond 15 Re
+
+/// The OP-77 external field at an SM point, in nT, from a folded parameter buffer.
+float3 opq_eval_sm(StructuredBuffer<float> par, float3 p_sm) {
+    const float x = p_sm.x;
+    const float y = p_sm.y;
+    const float z = p_sm.z;
+    const float y2 = y * y;
+    const float r2 = x * x + y2 + z * z;
+    if (!(r2 <= kOpqTemplateR2) || r2 < kOpqInnerR2) return float3(0.0f, 0.0f, 0.0f);
+    const float con = r2 < kOpqTaperR2 ? (r2 - kOpqInnerR2) / (kOpqTaperR2 - kOpqInnerR2) : 1.0f;
+    const float expr = exp(-kOpqExpRate * r2);
+
+    float bx = 0.0f;
+    float by = 0.0f;
+    float bz = 0.0f;
+    int ix = 0;        // the next B_x / B_z term: A at par[2+ix], B at par[34+ix], E at
+                       // par[110+ix], F at par[142+ix]
+    int iy = 0;        // the next B_y term: C at par[66+iy], D at par[88+iy]
+    float xb = 1.0f;
+    for (int i = 1; i <= 5; ++i) {
+        float yexb = xb;
+        for (int j = 1; j <= 3; ++j) {
+            if (i + 2 * j > 8) break;
+            int ijk = i + 2 * j + 1;
+            int k = 0;
+            float zeyexb = yexb;
+            for (;;) {
+                bz += (par[110 + ix] + par[142 + ix] * expr) * zeyexb;
+                bx += (par[2 + ix] + par[34 + ix] * expr) * zeyexb;
+                ++ix;
+                if (ijk > 8) break;
+                by += (par[66 + iy] + par[88 + iy] * expr) * zeyexb * y;
+                ++iy;
+                zeyexb *= z;
+                ++ijk;
+                ++k;
+                if (!(ijk <= 9 && k <= 4)) break;
+            }
+            yexb *= y2;
+        }
+        xb *= x;
+    }
+    return float3(bx * con, by * con, bz * con);
+}
+
+/// The OP-77 external field at a GSM point, in nT: GSM -> SM, the series, SM -> GSM.
+float3 opq_eval(StructuredBuffer<float> par, float3 p_gsm) {
+    const float sps = par[0];
+    const float cps = par[1];
+    const float xs = p_gsm.x * cps - p_gsm.z * sps;
+    const float zs = p_gsm.x * sps + p_gsm.z * cps;
+    const float3 b = opq_eval_sm(par, float3(xs, p_gsm.y, zs));
+    return float3(b.x * cps + b.z * sps, b.y, -b.x * sps + b.z * cps);
+}
+
+#ifdef KERNEL_OPQ
+
+[[vk::binding(0, 0)]] StructuredBuffer<float>   opq_pos;
+[[vk::binding(1, 0)]] RWStructuredBuffer<float> opq_out;
+[[vk::binding(2, 0)]] StructuredBuffer<float>   opq_params;
+[[vk::binding(3, 0)]] StructuredBuffer<uint>    opq_dims;
+
+[shader("compute")]
+[numthreads(256, 1, 1)]
+void irbem_opq_f32(uint3 tid : SV_DispatchThreadID) {
+    const uint n = opq_dims[0];
+    const uint i = tid.x;
+    if (i >= n) return;   // the grid is rounded up to a multiple of 256; the tail does nothing
+    const float3 b = opq_eval(opq_params,
+                              float3(opq_pos[3 * i + 0], opq_pos[3 * i + 1], opq_pos[3 * i + 2]));
+    opq_out[3 * i + 0] = b.x;
+    opq_out[3 * i + 1] = b.y;
+    opq_out[3 * i + 2] = b.z;
+}
+
+#endif  // KERNEL_OPQ
+
+// =============================================================================================
+// irbem_om97_f32 — Ostapenko & Maltsev (1997), one thread per point.
+//
+// The external field as eq. (2) of the paper: 17 polynomial harmonics (Table 1) in solar
+// magnetic coordinates normalized by 10 Re, weighted by 17 amplitudes that the HOST has already
+// regressed from the drivers (eq. (3), Tables 2 and 4). The harmonics are the Cartesian forms of
+// space/irbem/ext_ostapenko.hpp's om97_basis — the printed cylindrical rows with cos phi = x/rho,
+// sin phi = y/rho substituted and rho cancelled, so nothing is undefined on the dipole axis and
+// there is no sqrt, no division and no branch anywhere. Row 17 carries the Schmidt-normalized
+// factor sqrt(15)/8 the paper's text prescribes (the header's brief has the account).
+//
+// This mirrors om97_components<float> expression for expression, so a disagreement between the
+// two lanes is attributable to the DEVICE and not to the arithmetic having been written
+// differently on the two sides.
+//
+// bindings: 0 pos (3N floats, GSM, Re) | 1 out (3N floats, nT, GSM)
+//           2 params (19 floats: sin psi, cos psi, A1..A17)
+//           3 dims {N}
+// =============================================================================================
+
+/// The 17 harmonic amplitudes' weighted sum at a normalized SM point: the paper's Table 1 in
+/// Cartesian form, weighted by par[2..18]. Shared so a total-field tracer can call it.
+float3 om97_eval_sm(StructuredBuffer<float> par, float sps, float3 p) {
+    const float x = p.x, y = p.y, z = p.z;
+    const float x2 = x * x, y2 = y * y, z2 = z * z;
+    const float rho2 = x2 + y2;
+    const float rho4 = rho2 * rho2;
+    const float z3 = z2 * z, z4 = z2 * z2;
+    const float xy = x * y, xz = x * z, yz = y * z;
+    // The Schmidt-normalized leading factors: sqrt(3), sqrt(10), sqrt(3/2), sqrt(15)/8,
+    // sqrt(15)/2, sqrt(15).
+    const float s3 = 1.7320508f, s10 = 3.1622777f, s32 = 1.2247449f;
+    const float s15_8 = 0.48412292f, s15_2 = 1.9364917f, s15 = 3.8729833f;
+
+    float bx = 0.0f, by = 0.0f, bz = 0.0f;
+    // 1: uniform B_z
+    bz += par[2];
+    // 2: grad(r^3 P_3)
+    bx += par[3] * (-3.0f * xz);  by += par[3] * (-3.0f * yz);  bz += par[3] * (3.0f * (z2 - 0.5f * rho2));
+    // 3: grad(r^5 P_5)
+    const float s3v = 2.0f * z2 - 1.5f * rho2;
+    bx += par[4] * (-5.0f * xz * s3v);  by += par[4] * (-5.0f * yz * s3v);
+    bz += par[4] * (5.0f * (z4 - 3.0f * rho2 * z2 + 0.375f * rho4));
+    // 4, 5: ring-current rows
+    bz += par[5] * rho2;
+    bz += par[6] * rho4;
+    // 6: (-2 rho z^3, 0, z^4)
+    bx += par[7] * (-2.0f * x * z3);  by += par[7] * (-2.0f * y * z3);  bz += par[7] * z4;
+    // 7: sqrt(3) (z, 0, x)
+    bx += par[8] * (s3 * z);  bz += par[8] * (s3 * x);
+    // 8: grad(sqrt(10) rho z (z^2 - 3 rho^2/4) cos phi)
+    bx += par[9] * (s10 * z * (z2 - 0.25f * (9.0f * x2 + 3.0f * y2)));
+    by += par[9] * (-1.5f * s10 * xy * z);
+    bz += par[9] * (3.0f * s10 * x * (z2 - 0.25f * rho2));
+    // 9: B_x = z
+    bx += par[10] * z;
+    // 10: B_z = rho^2 x
+    bz += par[11] * (rho2 * x);
+    // 11: B_x = z^3
+    bx += par[12] * z3;
+    // 12: (-y^2 z, x y z, -x z^2 / 2)
+    bx += par[13] * (-y2 * z);  by += par[13] * (xy * z);  bz += par[13] * (-0.5f * x * z2);
+    // 13: sin psi grad(r^2 P_2)
+    bx += par[14] * (-x * sps);  by += par[14] * (-y * sps);  bz += par[14] * (2.0f * z * sps);
+    // 14: sin psi grad(r^4 P_4)
+    const float s14 = 0.5f * rho2 - 2.0f * z2;
+    bx += par[15] * (3.0f * x * s14 * sps);  by += par[15] * (3.0f * y * s14 * sps);
+    bz += par[15] * (2.0f * z * (2.0f * z2 - 3.0f * rho2) * sps);
+    // 15: sin psi uniform B_x
+    bx += par[16] * sps;
+    // 16: sin psi grad(sqrt(3/2) rho (2 z^2 - rho^2/2) cos phi)
+    bx += par[17] * (s32 * (2.0f * z2 - 0.5f * (3.0f * x2 + y2)) * sps);
+    by += par[17] * (-s32 * xy * sps);
+    bz += par[17] * (4.0f * s32 * xz * sps);
+    // 17: sin psi grad((sqrt(15)/8) rho (8 z^4 - 12 rho^2 z^2 + rho^4) cos phi)
+    bx += par[18] * (s15_8 * (8.0f * z4 - 12.0f * rho2 * z2 + rho4 - 24.0f * x2 * z2 + 4.0f * rho2 * x2) * sps);
+    by += par[18] * (s15_2 * xy * (rho2 - 6.0f * z2) * sps);
+    bz += par[18] * (s15 * xz * (4.0f * z2 - 3.0f * rho2) * sps);
+    return float3(bx, by, bz);
+}
+
+/// The OM97 external field at a GSM point, in nT: GSM -> SM about y by the tilt, the paper's
+/// 10 Re normalization, the harmonics, and the rotation back.
+float3 om97_eval(StructuredBuffer<float> par, float3 p_gsm) {
+    const float sps = par[0];
+    const float cps = par[1];
+    const float k = 0.1f;
+    const float xs = (p_gsm.x * cps - p_gsm.z * sps) * k;
+    const float ys = p_gsm.y * k;
+    const float zs = (p_gsm.x * sps + p_gsm.z * cps) * k;
+    const float3 b = om97_eval_sm(par, sps, float3(xs, ys, zs));
+    return float3(b.x * cps + b.z * sps, b.y, -b.x * sps + b.z * cps);
+}
+
+#ifdef KERNEL_OSTAPENKO
+
+[[vk::binding(0, 0)]] StructuredBuffer<float>   om97_pos;
+[[vk::binding(1, 0)]] RWStructuredBuffer<float> om97_out;
+[[vk::binding(2, 0)]] StructuredBuffer<float>   om97_params;
+[[vk::binding(3, 0)]] StructuredBuffer<uint>    om97_dims;
+
+[shader("compute")]
+[numthreads(256, 1, 1)]
+void irbem_om97_f32(uint3 tid : SV_DispatchThreadID) {
+    const uint n = om97_dims[0];
+    const uint i = tid.x;
+    if (i >= n) return;   // the grid is rounded up to a multiple of 256; the tail does nothing
+    const float3 b = om97_eval(om97_params,
+                               float3(om97_pos[3 * i + 0], om97_pos[3 * i + 1], om97_pos[3 * i + 2]));
+    om97_out[3 * i + 0] = b.x;
+    om97_out[3 * i + 1] = b.y;
+    om97_out[3 * i + 2] = b.z;
+}
+
+#endif  // KERNEL_OSTAPENKO

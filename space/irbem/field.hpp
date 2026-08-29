@@ -181,6 +181,7 @@
 #include <span>
 #include <vector>
 
+#include "batch_soa.hpp"
 #include "frames.hpp"
 #include "igrf.hpp"
 #include "policy.hpp"
@@ -777,12 +778,21 @@ inline void interleave(std::span<const Position<Frame::GEO>> points, std::span<f
  * @return @ref Status::DomainError on a length mismatch, @ref Status::Ok otherwise. The value is
  *         `true` when the device serviced the call — asserted by a test rather than assumed,
  *         because a silent fallback to the host is what makes a speed claim worthless.
+ * @note The host lane is @ref igrf_batch_host — the SIMD strip evaluator of @ref batch_soa.hpp,
+ *       eight points per strip with the point index as the vector lane. It is bit-identical per
+ *       point to the scalar `Igrf::evaluate` loop it replaced (memcmp-asserted) and measured
+ *       **3.6×** faster at 2¹⁶ points (100 vs 362 ns/point on a pinned P-core;
+ *       `BM_cpu_igrf_batch_soa` in `bench/irbem_bench.cpp`). The device figures in the table above were measured against the
+ *       earlier scalar host loop and are left as measured; the SIMD lane moves the true device
+ *       break-even upward by about that factor, and @ref field_batch_crossover has NOT been
+ *       re-tuned here — that needs the device side re-measured, not inferred.
  * @complexity O(N·NMAX²); on the device those run concurrently.
  * @alloc none on the host lane. The device lane stages `3N` floats in and `3N` out.
  * @test IrbemField.FieldBatchAgreesWithTheReferenceLane
  * @test IrbemField.FieldBatchMatchesTheOracleGoldens
  * @test IrbemField.FieldBatchUsesTheDeviceWhenOneIsAvailable
  * @test IrbemField.BatchRoutinesRefuseMismatchedSpans
+ * @test IrbemBatchSimd.FieldBatchHostLaneIsBitIdentical
  */
 template <int NMAX>
 [[nodiscard]] inline Result<bool> field_batch(const Igrf<NMAX>& model,
@@ -811,11 +821,10 @@ template <int NMAX>
     }
 #endif
 
-    for (std::size_t i = 0; i < n; ++i) {
-        b[i] = model.evaluate(points[i]);
-        b_mag[i] = b[i].magnitude();
-    }
-    return {Status::Ok, false};
+    // The host lane: the SIMD strip evaluator of batch_soa.hpp, bit-identical per point to the
+    // `model.evaluate` loop it replaced (asserted by memcmp, not tolerance) and measured 3.6× faster.
+    // The spans were length-checked above, so the only status it can return is Ok.
+    return {igrf_batch_host(model, points, b, b_mag), false};
 }
 
 /**

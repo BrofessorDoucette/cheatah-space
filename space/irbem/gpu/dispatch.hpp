@@ -221,7 +221,7 @@ inline constexpr std::size_t always_on_device = 1;
  * and cannot drift into a registry that allocates. Adding a kernel means adding a row here AND an
  * entry point there; the completeness test fails if only one of the two happens.
  */
-inline constexpr std::array<KernelInfo, 7> registered_kernels{{
+inline constexpr std::array<KernelInfo, 11> registered_kernels{{
     // MEASURED, RTX 3070 Ti / Vulkan, best of five per size, transfers included, against this
     // header's own host lane built -O2 -ffp-contract=off (n : device Mpts/s : host Mpts/s):
     //   2^10 : 14 : 444 | 2^14 : 145 : 440 | 2^16 : 240 : 440 | 2^18 : 280 : 446
@@ -365,6 +365,101 @@ inline constexpr std::array<KernelInfo, 7> registered_kernels{{
      "field-line trace and I through IGRF+T89; one thread per FIELD LINE, whole RK4 chain "
      "on-device; ext = one Kp bin's T89 block + gsm_from_geo",
      8, 0, 512},
+
+    // The Olson-Pfitzer dynamic field (kext = 6): the SHARED t89_eval on a scaled position, times
+    // s^3, plus a ~40-flop ring disc. Same 24 bytes in and 12 out as the T89 row for ~450 flops,
+    // so the same side of the ridge. MEASURED, RTX 3070 Ti / Vulkan, best of five per size,
+    // transfers included, against ext_opd.hpp's own fp32 host lane built -O3 -march=native
+    // -ffp-contract=off, points scattered at 2..20 Re:
+    //
+    //     N points :  1024 :  2048 :  4096 : 16384 : 65536 :  2^20
+    //     speedup  : 0.86x : 1.59x : 2.97x : 8.01x : 10.5x : 14.2x
+    //
+    //   at N = 2^20 : device 3.95 ns/point | host 55.9 ns/point
+    //   max ABSOLUTE deviation device-vs-host over 2^20 points: 6.9e-05 nT.
+    //
+    // The device first wins at 2048 — one step later than the plain T89 row's derived ~1300 —
+    // because the device-side cost is the same t89_eval plus a ring and the ~70 us floor is the
+    // same, while the host lane is marginally dearer per point; the measured 2048 stands as the
+    // crossover rather than the row above's.
+    //
+    // Params: the T89 quiet block [0..29] exactly as t89_eval reads it, then s and the ring
+    // amplitude C — 32 floats, no coefficient buffer, dispatch_batch's pos/out/params/dims shape.
+    {"irbem_opd_f32",
+     "Olson-Pfitzer dynamic external B (nT) at each GSM point (Re); params = {T89 quiet block "
+     "(30), s, C}",
+     4, 32, 2048},
+
+    // Mead & Fairfield 1975 (kext = 1): three quadratic polynomials, ~50 flops for the same 24
+    // bytes in and 12 out — ~1.4 flops/byte, within a factor of three of the dipole row's 0.5
+    // and an order of magnitude below T89's ~11. MEASURED, RTX 3070 Ti / Vulkan, best of seven
+    // per size, transfers included, against ext_mead.hpp's own fp32 host lane built -O3
+    // -march=native -ffp-contract=off, points scattered at 2..20 Re:
+    //
+    //     N points :   256 :  1024 :  2048 :  4096 : 16384 : 65536 :  2^20 :  2^22
+    //     speedup  : 0.01x : 0.05x : 0.10x : 0.18x : 0.47x : 0.75x : 0.90x : 0.95x
+    //
+    //   at N = 2^22 : device 4.95 ns/point (202 Mpts/s) | host 4.72 ns/point (212 Mpts/s)
+    //   max absolute deviation device-vs-host over 2^22 points: 5.3e-05 nT.
+    //
+    // The device NEVER wins and the ratio is still below 1.0 at four million points, flattening
+    // toward the bus limit exactly as the dipole row does: the host's vectorized loop evaluates a
+    // 50-flop polynomial faster than PCIe can move the point. The verdict is a fact about this
+    // kernel's arithmetic intensity, not about the seam — the same 24 bytes carry T89's ~400
+    // flops to a 15x win. The kernel exists so that a total-field tracer can call mead_eval
+    // on-device, where the point is resident; as a batched field kernel it is routed to the host.
+    {"irbem_mead_f32",
+     "Mead & Fairfield 1975 external B (nT) at each GSM point (Re); params = {sin psi, cos psi, "
+     "psi deg, a1..a7, b1..b3, c1..c7} for one Kp bin",
+     4, 20, never_faster_on_device},
+    // MEASURED, RTX 3070 Ti / Vulkan, best of five per size, transfers included, against
+    // ext_opq.hpp's own fp32 host lane built -O3 -march=native -ffp-contract=off, over points
+    // scattered at 2.5..15 Re (the model's whole region):
+    //
+    //     N points :  1024 :  2048 :  4096 : 16384 : 65536 :  2^20 :  2^22
+    //     speedup  : 0.45x : 1.19x : 2.32x : 6.33x : 11.9x : 11.2x : 14.9x
+    //
+    //   at N = 2^22 : device 3.35 ns/point | host 49.9 ns/point
+    //   max ABSOLUTE deviation device-vs-host over 2^20 points: 8.0e-05 nT, against external
+    //   fields of tens of nT — the same contraction-level agreement the T89 row reports.
+    //
+    // Olson & Pfitzer (1977) is 86 fused polynomial terms and one exp for 24 bytes in and 12 out —
+    // ~15 flops/byte, T89's regime exactly, with no data-dependent branch (the loop's trip
+    // pattern depends on nothing but its own counters). Crossover from the measured curve: 2048
+    // is the first size at which the device wins (1.19x), and the same threshold T89 carries.
+    //
+    // No coefficient BUFFER: the 172 tilt-folded coefficients plus sin psi and cos psi ride in
+    // the parameter block, so the kernel fits dispatch_batch's pos/out/params/dims shape.
+    {"irbem_opq_f32",
+     "Olson-Pfitzer 1977 quiet external B (nT) at each GSM point (Re); params = {sin psi, "
+     "cos psi, A(32), B(32), C(22), D(22), E(32), F(32)} folded for one tilt",
+     4, 174, 2048},
+    // MEASURED, RTX 3070 Ti / Vulkan, best of five per size, transfers included, against
+    // ext_ostapenko.hpp's own fp32 host lane built -O3 -march=native -ffp-contract=off, over
+    // points scattered at 3..10 Re (the paper's fitted region):
+    //
+    //     N points :  1024 :  2048 :  4096 : 16384 : 65536 :  2^20 :  2^22
+    //     speedup  : 0.37x : 0.80x : 1.60x : 4.36x : 7.79x : 7.83x : 10.1x
+    //
+    //   at N = 2^22 : device 3.37 ns/point | host 34.1 ns/point
+    //   max ABSOLUTE deviation device-vs-host over 2^16 points: 4.6e-05 nT; device vs the fp64
+    //   reference over 8192 points: 2.3e-05 nT.
+    //
+    // Ostapenko & Maltsev (1997) is 17 polynomial harmonics under one rotation — ~250 flops for
+    // 24 bytes in and 12 out, ~10 flops/byte, a little under T89's and in the same regime: no
+    // loop with a data-dependent trip count, no branch, no transcendental. The host lane is
+    // 1.4x faster per point than T89's (34 vs 49 ns) for the same reason, which is why the
+    // crossover sits one power of two ABOVE T89's 2048 despite the same device throughput:
+    // at 2048 the device is still paying its ~80 us dispatch floor against a 67 us host loop.
+    // Crossover from the measured curve: the first power of two at which the device wins
+    // outright. Measured by bench/om97_bench.cpp.
+    //
+    // No coefficient BUFFER: the 17 amplitudes are the drivers' regression, done ONCE per batch
+    // on the host, and ride in the parameter block with sin psi and cos psi.
+    {"irbem_om97_f32",
+     "Ostapenko-Maltsev 1997 external B (nT) at each GSM point (Re); params = {sin psi, cos psi, "
+     "A1..A17} for one driver set",
+     4, 19, 4096},
 }};
 
 /// The registry and the lease capacity must agree, checked at COMPILE time: a kernel that binds
