@@ -70,6 +70,7 @@ add_executable(cheatah_space_tests
     irbem_opd_test.cpp
     irbem_ostapenko_test.cpp
     irbem_batch_simd_test.cpp
+    irbem_purr_test.cpp
     irbem_trace_api_test.cpp
     irbem_driftshell_test.cpp
     irbem_total_field_test.cpp
