@@ -16,7 +16,20 @@ rather than pay it. That cost is the opportunity.
 | piece | state |
 |---|---|
 | [`frames.hpp`](frames.hpp) — frames, `Position<F>` / `FieldVector<F>`, the `sysaxes` boundary | **in, gated** |
-| coordinate transforms, IGRF, the external field models, tracing, L\* | not started |
+| coordinate transforms — geodetic (WGS84/Bowring), the Hapgood rotations, heliospheric | **in, gated** |
+| [`igrf.hpp`](igrf.hpp) — IGRF-14 to degree 13, coefficients sourced from IAGA | **in, gated** |
+| external field models — [T89](ext_t89.hpp) (4), [Mead](ext_mead.hpp) (1), [OP-quiet](ext_opq.hpp) (5), [OP-dynamic](ext_opd.hpp) (6), [Ostapenko](ext_ostapenko.hpp) (8) | **in, gated** |
+| tracing, the bounce integral, L\*, drift shells, shell splitting | **in, gated** |
+| the GPU lane — IGRF, T89, the total field, the line integral, the flux cap | **in, gated** |
+| [`batch_soa.hpp`](batch_soa.hpp) — the CPU batch lane, point index as the SIMD lane (3.61×) | **in, gated** |
+| T96 (7), T01 (9), T01-storm (10), T87 (2/3) | in flight |
+| TS07D (13/14), the belt/atmosphere/effects models, TA15/TA16/GEO | not started |
+
+Two models carry a **measured, documented gap** rather than parity, because the clean room cannot
+reach what was never published: [T89](ext_t89.hpp) (IRBEM's `kext=4` is the unpublished 1992 T89c
+revision) and [OP-dynamic](ext_opd.hpp) (neither its form nor its coefficients were ever published;
+~50% RMS-relative, structure floor 67.8%). Each header states its own number. Everything else
+targets oracle parity — Mead reaches 2.1e-9 relative.
 
 ## Licensing — why this is written to the papers
 

@@ -1,4 +1,4 @@
-# space.cdf (roadmap)
+# space.cdf
 
 NASA **Common Data Format** I/O for cheatah — the format space-physics data ships in
 (variables, attributes, records, 0–10-D arrays, optional compression). Written **from scratch

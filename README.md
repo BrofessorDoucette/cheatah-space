@@ -1,9 +1,9 @@
 # cheatah-space
 
-> ⚠️ **Work in progress.** Early alpha. `space.time` works, is fully covered, and is
-> QA-gated; `space.irbem` has begun (its frame layer is in and gated, the models are not);
-> `space.cdf` is a roadmap only. APIs, layout, and namespaces may change until the first
-> tagged release.
+> ⚠️ **Work in progress.** Early alpha. All three modules are in and QA-gated at 100% line and
+> function coverage: `space.time`, `space.cdf` (readers over real NASA files), and `space.irbem`
+> (IGRF-14, five external field models, L\*, drift shells, and a GPU lane for the integrals).
+> APIs, layout, and namespaces may change until the first tagged release.
 
 The first cheatah standard-library **extension**: the `space` package — astronomy and
 space-physics. Hand-authored, header-only C++20 (templated with concepts), surfaced in the
@@ -35,8 +35,8 @@ push (scripts/test-biome-install.sh).
 | module | what it is | status |
 |---|---|---|
 | **`space.time`** | Julian Date, Modified Julian Date, J2000, and the NASA **CDF_EPOCH** bridge. Templated with concepts (scalar `Value` \| numeric `ndarray` \| future datetime-struct `ndarray`). The pun (spacetime) is intended. | **working** → [space/time](space/time/) |
-| **`space.cdf`** | NASA **Common Data Format** I/O, written from scratch in C++. | roadmap → [space/cdf](space/cdf/) |
-| **`space.irbem`** | Radiation-belt & magnetic-field models — a from-scratch reimplementation of **[PRBEM/IRBEM](https://github.com/PRBEM/IRBEM)**, written to the published papers, vectorized on the CPU and with the field-line and drift-shell integrals evaluated in parallel on the GPU. | **in progress** → [space/irbem](space/irbem/) |
+| **`space.cdf`** | NASA **Common Data Format** I/O, written from scratch in C++ — the record layer, the variable index tree, and a reader verified against real mission files. | **working** → [space/cdf](space/cdf/) |
+| **`space.irbem`** | Radiation-belt & magnetic-field models — a from-scratch reimplementation of **[PRBEM/IRBEM](https://github.com/PRBEM/IRBEM)**, written to the published papers, vectorized on the CPU and with the field-line and drift-shell integrals evaluated in parallel on the GPU. | **working** → [space/irbem](space/irbem/) |
 
 The through-line: each module has a canonical reference (NASA CDF C lib, IRBEM Fortran) we
 verify against and then outperform. Those references are **optional, dev-only** oracles — never
@@ -63,8 +63,8 @@ cheatah-space/
 ├── space/                  # the `space` package (import root; headers + .sha512 sidecars)
 │   ├── space.hpp           # package umbrella — includes the submodules
 │   ├── time/time.hpp       # space.time  (C++20, concepts, vectorized)   [working]
-│   ├── cdf/                # space.cdf    (roadmap)
-│   └── irbem/              # space.irbem  (in progress: frames.hpp)
+│   ├── cdf/                # space.cdf    (records, index tree, reader)      [working]
+│   └── irbem/              # space.irbem  (IGRF, external models, L*, GPU)   [working]
 ├── systests/               # cheatah (.purr) system tests, importing space.* end to end
 ├── tests/                  # C++ unit tests (GoogleTest) — the coverage + memcheck harness
 ├── scripts/                # qa_gate.sh + the individual checks it runs (see Developing)
@@ -116,8 +116,9 @@ committed by the gate:
 | Branches | 93.73% |
 <!-- coverage:end -->
 
-(`space.time` is straight-line arithmetic — it has no branches; the Branches metric will
-light up with `space.cdf`.)
+(`space.time` is straight-line arithmetic and has no branches of its own; the Regions and Branches
+metrics come from `space.cdf` and `space.irbem`. Lines and functions are the gated pair — the gate
+fails below 100% on either.)
 
 ## License
 
