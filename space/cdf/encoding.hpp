@@ -129,7 +129,12 @@ inline Raw load_raw(const std::byte* p, bool swap) noexcept {
 template <class Out, class Raw>
 inline void convert_run(const std::byte* src, Out* dst, std::uint64_t n, bool swap) noexcept {
     for (std::uint64_t i = 0; i < n; ++i) {
-        dst[i] = static_cast<Out>(load_raw<Raw>(src + i * sizeof(Raw), swap));
+        // Raw is `std::int8_t` only for CDF_INT1/CDF_BYTE, which the format defines as 1-byte
+        // SIGNED integers, so sign extension is the REQUIRED conversion here: casting through
+        // `unsigned char` as cert-str34-c suggests would decode a stored -1 as 255. That rule is
+        // about character data used as an integer; this is a numeric type that happens to be one
+        // byte wide. CDF_UINT1 arrives as `std::uint8_t` through the same template, unaffected.
+        dst[i] = static_cast<Out>(load_raw<Raw>(src + i * sizeof(Raw), swap));  // NOLINT(bugprone-signed-char-misuse,cert-str34-c) CDF_INT1 is signed: sign extension is correct
     }
 }
 
