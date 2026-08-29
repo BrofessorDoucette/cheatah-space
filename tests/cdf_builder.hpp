@@ -76,20 +76,21 @@ struct Minimal {
     std::uint64_t vvr_data() const { return vvr + 12; }
 };
 
-// One CDF_REAL8 zVariable named `name` holding values[0..n), NETWORK (big-endian) encoded.
-inline Minimal minimal_real8(const std::string& name, const std::vector<double>& values,
-                             cheatah::space::cdf::Encoding enc = cheatah::space::cdf::Encoding::Network) {
+// One zVariable of any type, its records given as raw bytes already in the file's byte order.
+// `record_bytes` is the concatenation of all records; `records` is how many there are.
+inline Minimal minimal_raw(const std::string& name, cheatah::space::cdf::DataType type,
+                           std::int32_t num_elems, std::int32_t records,
+                           const std::vector<std::byte>& record_bytes,
+                           cheatah::space::cdf::Encoding enc = cheatah::space::cdf::Encoding::Network) {
     using namespace cheatah::space::cdf;
     Minimal m;
     Blob& b = m.blob;
-    m.records = static_cast<std::int32_t>(values.size());
+    m.records = records;
 
-    // magic
     b.append(8);
     b.put_be32(0, kMagicV3);
     b.put_be32(4, kMagicUncompressed);
 
-    // CDR: 56 fixed + 256 copyright = 312
     m.cdr = b.append(312);
     b.put_i64(m.cdr + 0, 312);
     b.put_i32(m.cdr + 8, static_cast<std::int32_t>(RecordType::Cdr));
@@ -98,29 +99,26 @@ inline Minimal minimal_real8(const std::string& name, const std::vector<double>&
     b.put_i32(m.cdr + 28, static_cast<std::int32_t>(enc));
     b.put_be32(m.cdr + 32, kCdrFlagRowMajority | kCdrFlagSingleFile);
 
-    // GDR: 84 bytes, no rDims
     m.gdr = b.append(84);
     b.put_i64(m.cdr + 12, static_cast<std::int64_t>(m.gdr));
     b.put_i64(m.gdr + 0, 84);
     b.put_i32(m.gdr + 8, static_cast<std::int32_t>(RecordType::Gdr));
-    b.put_i32(m.gdr + 52, -1);     // rMaxRec
-    b.put_i32(m.gdr + 60, 1);      // NzVars
+    b.put_i32(m.gdr + 52, -1);
+    b.put_i32(m.gdr + 60, 1);
 
-    // zVDR: 340 + 4 (zNumDims = 0) = 344
     m.zvdr = b.append(344);
     b.put_i64(m.gdr + 20, static_cast<std::int64_t>(m.zvdr));
     b.put_i64(m.zvdr + 0, 344);
     b.put_i32(m.zvdr + 8, static_cast<std::int32_t>(RecordType::ZVariableDescriptor));
-    b.put_i32(m.zvdr + 20, static_cast<std::int32_t>(DataType::Real8));
-    b.put_i32(m.zvdr + 24, m.records - 1);
-    b.put_be32(m.zvdr + 44, kCdrFlagRowMajority);   // record variance, no pad, uncompressed
-    b.put_i32(m.zvdr + 64, 1);                        // NumElems
-    b.put_i32(m.zvdr + 68, 0);                        // Num
-    b.put_i64(m.zvdr + 72, -1);                       // CPRorSPRoffset: -1 means none
+    b.put_i32(m.zvdr + 20, static_cast<std::int32_t>(type));
+    b.put_i32(m.zvdr + 24, records - 1);
+    b.put_be32(m.zvdr + 44, 1U);                       // record variance, no pad, uncompressed
+    b.put_i32(m.zvdr + 64, num_elems);
+    b.put_i32(m.zvdr + 68, 0);
+    b.put_i64(m.zvdr + 72, -1);
     std::memcpy(b.bytes.data() + m.zvdr + 84, name.data(), name.size());
 
-    if (m.records > 0) {
-        // VXR: 28 + 16 * 1
+    if (records > 0) {
         m.vxr = b.append(44);
         b.put_i64(m.zvdr + 28, static_cast<std::int64_t>(m.vxr));
         b.put_i64(m.zvdr + 36, static_cast<std::int64_t>(m.vxr));
@@ -129,24 +127,38 @@ inline Minimal minimal_real8(const std::string& name, const std::vector<double>&
         b.put_i32(m.vxr + 20, 1);
         b.put_i32(m.vxr + 24, 1);
         b.put_i32(m.vxr + 28, 0);
-        b.put_i32(m.vxr + 32, m.records - 1);
+        b.put_i32(m.vxr + 32, records - 1);
 
-        // VVR
-        const std::uint64_t vvr_size = 12 + 8 * static_cast<std::uint64_t>(m.records);
+        const std::uint64_t vvr_size = 12 + record_bytes.size();
         m.vvr = b.append(vvr_size);
         b.put_i64(m.vxr + 36, static_cast<std::int64_t>(m.vvr));
         b.put_i64(m.vvr + 0, static_cast<std::int64_t>(vvr_size));
         b.put_i32(m.vvr + 8, static_cast<std::int32_t>(RecordType::Vvr));
-        for (std::size_t i = 0; i < values.size(); ++i) {
-            if (enc == Encoding::Network) {
-                b.put_f64_be(m.vvr + 12 + 8 * i, values[i]);
-            } else {
-                std::memcpy(b.bytes.data() + m.vvr + 12 + 8 * i, &values[i], 8);  // host LE
-            }
-        }
+        std::memcpy(b.bytes.data() + m.vvr + 12, record_bytes.data(), record_bytes.size());
     }
-    b.put_i64(m.gdr + 36, static_cast<std::int64_t>(b.size()));   // eof
+    b.put_i64(m.gdr + 36, static_cast<std::int64_t>(b.size()));
     return m;
+}
+
+// Encode a host value into `bytes` in the given byte order (big-endian for Network).
+template <class T>
+inline void push_value(std::vector<std::byte>& bytes, T v, bool big_endian) {
+    unsigned char raw[sizeof(T)];
+    std::memcpy(raw, &v, sizeof(T));
+    if (big_endian) {
+        for (std::size_t i = 0; i < sizeof(T); ++i) { bytes.push_back(std::byte{raw[sizeof(T) - 1 - i]}); }
+    } else {
+        for (std::size_t i = 0; i < sizeof(T); ++i) { bytes.push_back(std::byte{raw[i]}); }
+    }
+}
+
+// One CDF_REAL8 zVariable named `name` holding values[0..n).
+inline Minimal minimal_real8(const std::string& name, const std::vector<double>& values,
+                             cheatah::space::cdf::Encoding enc = cheatah::space::cdf::Encoding::Network) {
+    std::vector<std::byte> raw;
+    for (double v : values) { push_value(raw, v, enc == cheatah::space::cdf::Encoding::Network); }
+    return minimal_raw(name, cheatah::space::cdf::DataType::Real8, 1,
+                       static_cast<std::int32_t>(values.size()), raw, enc);
 }
 
 }  // namespace cdftest

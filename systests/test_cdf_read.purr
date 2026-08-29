@@ -1,0 +1,39 @@
+# space.cdf — open a real NASA CDF and read its variables into ndarrays, end to end through
+# purrc and the cheatah runtime.
+#
+# The expected numbers are the ones decoded by hand from the OMNI file's raw bytes before the
+# reader existed: `F` opens 6.92, 5.84, 5.71 nT and `Epoch` opens at 2015-01-01T00:00:00Z.
+# The corpus is not committed, so when the file is absent this prints the fetch command and
+# passes — the QA gate must stay green offline.
+import io
+import os
+import ndarray
+import space.cdf as cdf
+import check
+
+io.print("== space.cdf: read a real CDF ==")
+let f = 0
+let path = "space/cdf/vendor/corpus/tier1/omni_hro2_1min_20150101_v01.cdf"
+
+if os.path.exists(path) == false {
+    io.print("  SKIP corpus absent — run: scripts/cdf-corpus.sh fetch --tier 1")
+} else {
+    let file = cdf.open(path)
+    f += check.int_eq("47 variables", len(cdf.var_names(file)), 47)
+    f += check.is_true("first variable is Epoch", cdf.var_names(file)[0] == "Epoch")
+    f += check.int_eq("F has 44640 records", cdf.record_count(file, "F"), 44640)
+    f += check.is_true("F is CDF_REAL4", cdf.data_type_name(file, "F") == "CDF_REAL4")
+    f += check.int_eq("F shape is [44640]", cdf.shape(file, "F")[0], 44640)
+
+    let b = cdf.values(file, "F")
+    f += check.int_eq("F decoded 44640 values", ndarray.size_of(b), 44640)
+    f += check.near_eq("F[0] = 6.92 nT", b[0], 6.92, 0.005)
+    f += check.near_eq("F[1] = 5.84 nT", b[1], 5.84, 0.005)
+    f += check.near_eq("F[2] = 5.71 nT", b[2], 5.71, 0.005)
+
+    let t = cdf.values(file, "Epoch")
+    f += check.close_eq("Epoch[0] is 2015-01-01T00:00:00Z", t[0], 63587289600000.0)
+    f += check.close_eq("one-minute cadence", t[1] - t[0], 60000.0)
+}
+
+check.result(f)

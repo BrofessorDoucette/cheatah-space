@@ -1,4 +1,9 @@
 #pragma once
+// cheatah-deps: ndarray
+//
+// space.cdf hands variables back as ndarrays, so the package always needs it. purrc reads
+// this marker from the header it RESOLVES — `import space.cdf` resolves module `space`,
+// i.e. this file — and puts ndarray on the include and link paths for every consumer.
 
 /**
  * @file space.hpp
@@ -10,8 +15,8 @@
  *
  * Submodules:
  *   - space.time  — Julian dates & epoch conversions (the CDF_EPOCH bridge).   [working]
- *   - space.cdf   — NASA Common Data Format I/O.                                [roadmap]
- *   - space.irbem — radiation-belt / magnetic-field models (IRBEM reimpl).      [building]
+ *   - space.cdf   — NASA Common Data Format I/O.                                [working]
+ *   - space.irbem — radiation-belt / magnetic-field models (IRBEM reimpl).      [working]
  */
 
 #include "time/time.hpp"

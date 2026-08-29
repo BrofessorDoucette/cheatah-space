@@ -472,11 +472,12 @@ enum class ErrorCode : std::uint8_t {
     EmptyFile,            ///< The file is too small to contain even the magic numbers.
     UnsupportedLayout,    ///< An N-D variable in a column-major file; the transpose is not in yet.
     UnsupportedEncoding,  ///< A VAX float encoding; the conversion is not in yet.
+    LossyConversion,      ///< The requested array type cannot hold this variable's values exactly.
 };
 
 /// How many ErrorCode enumerators exist, including None. The unit tests assert one crafted
 /// failure per code against this, so a new code cannot be added without a test that provokes it.
-inline constexpr std::size_t kErrorCodeCount = 27;
+inline constexpr std::size_t kErrorCodeCount = 28;
 
 namespace detail {
 
@@ -516,6 +517,7 @@ constexpr std::string_view error_message(ErrorCode code) noexcept {
         case ErrorCode::EmptyFile: return "file is too small to be a CDF";
         case ErrorCode::UnsupportedLayout: return "multi-dimensional column-major variables are not supported yet";
         case ErrorCode::UnsupportedEncoding: return "VAX floating-point encodings are not supported yet";
+        case ErrorCode::LossyConversion: return "the requested array type cannot hold these values exactly (use values_i64 for INT8/TT2000, values for floats)";
     }
     return "unknown error";
 }
