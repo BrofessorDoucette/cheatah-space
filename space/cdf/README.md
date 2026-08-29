@@ -5,6 +5,8 @@ NASA **Common Data Format** I/O for cheatah — the format space-physics data sh
 in C++ with zero dependencies**: NASA's CDF library is *not* linked and *not* required to
 build, install, or use `space.cdf`. Goal: the fastest CDF reader/writer we can build.
 
+> **Status:** working — reads CDF 3.x, including GZIP-compressed variables, verified against real mission files. Writing is not implemented.
+
 > Reference: <https://cdf.gsfc.nasa.gov/>, and the authoritative
 > [CDF 3.9 Internal Format Description](https://spdf.gsfc.nasa.gov/pub/software/cdf/doc/cdf39/cdf39ifd.pdf).
 > We implement from that specification; we do not read or copy NASA's source.

@@ -5,6 +5,8 @@ Radiation-belt & magnetic-field models for cheatah — a **from-scratch reimplem
 Written in C++20 with zero external dependencies: no Fortran runtime, no IRBEM link, nothing
 required to build, install, or use `space.irbem`.
 
+> **Status:** working from cheatah — IGRF-14, five external field models, L\*, drift shells and the GPU lane, with a cheatah surface in [`purr.hpp`](purr.hpp) covering the epoch, `make_lstar`, `get_mlt` and `coord_trans`. The rest of the 57 routines are reachable from C++ only for now. Which models are VERIFIED, and over what part of the domain, is in [docs/VERIFICATION.md](docs/VERIFICATION.md).
+
 The reference library is single-threaded, unvectorized, ships compiled with no `-O` flag at all,
 and carries ~20 mutable `COMMON` blocks that make it actively hostile to threading. One L\*
 evaluation costs **~10⁵ magnetic-field model calls** — the [LANL\*

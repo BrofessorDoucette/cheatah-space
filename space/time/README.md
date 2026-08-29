@@ -3,6 +3,8 @@
 Julian dates & epoch conversions — an extension *for* the cheatah standard time library.
 The pun (spacetime) is intended. Hand-authored, header-only C++20, **zero dependencies**.
 
+> **Status:** working — Julian/Modified-Julian/J2000 conversions and the CDF_EPOCH bridge, scalar and vectorized over `ndarray`, 100% covered and systested.
+
 ```purr
 import space.time as st
 import ndarray
