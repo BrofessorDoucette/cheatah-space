@@ -13,6 +13,13 @@ rather than pay it. That cost is the opportunity.
 
 ## Status
 
+> **Implemented is not the same claim as verified.** Which models have been checked against the
+> Fortran reference, to what tolerance, **over which part of the domain** (which activity regimes,
+> which real storm events, which epochs, tilts, radii and local times), and which carry a measured
+> and permanent gap rather than parity, is recorded in
+> **[docs/VERIFICATION.md](docs/VERIFICATION.md)** — including what is *not* established. Read it
+> before trusting or extending any routine here.
+
 | piece | state |
 |---|---|
 | [`frames.hpp`](frames.hpp) — frames, `Position<F>` / `FieldVector<F>`, the `sysaxes` boundary | **in, gated** |
