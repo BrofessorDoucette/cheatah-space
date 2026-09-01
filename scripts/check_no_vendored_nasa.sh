@@ -50,4 +50,31 @@ if [ -n "$hits" ]; then
     fail "third-party source copied into the tracked tree"
 fi
 
-echo "[no-vendored-nasa] clean — no vendored reference implementation is tracked."
+# 4. No tracked file may cite IRBEM's FORTRAN SOURCE as where a value came from.
+#
+#    This is the space.irbem counterpart of (3), and it catches a failure (3) cannot: not source
+#    copied in, but a NUMBER read out of source/*.f and transcribed with a citation. That is a
+#    provenance breach even though not one line of their code is present, because the model is
+#    then derived from LGPL-3 source rather than from the papers — and the derivation trail says
+#    so in writing.
+#
+#    It is not hypothetical. wave4-wip's ext_t01.hpp carries three such citations naming
+#    `source/Tsyganenko01.f` and specific line numbers. They were written honestly, by an agent
+#    following a rule that permitted "a single number", and they are exactly why that rule is now
+#    "read vendor/IRBEM/docs/source/**.rst, never source/*.f". Nothing noticed for a month.
+#
+#    The oracle is a BLACK BOX: dlopen it, call its documented C entry points, measure what comes
+#    back. A constant that cannot be reached that way or from a paper does not get transcribed —
+#    the model documents the gap instead. See space/irbem/docs/VERIFICATION.md.
+fortran_cite='source/[A-Za-z0-9_]+\.f\b'
+hits="$(git grep -l -E "$fortran_cite" -- . ':(exclude)scripts/check_no_vendored_nasa.sh' 2>/dev/null)"
+if [ -n "$hits" ]; then
+    printf '\n[no-vendored-nasa] These tracked files cite IRBEM Fortran source as a provenance:\n\n'
+    git grep -n -E "$fortran_cite" -- . ':(exclude)scripts/check_no_vendored_nasa.sh' | sed 's/^/    /'
+    printf '\nThe oracle is read as a BLACK BOX, never as source. Re-derive the value from the\n'
+    printf 'published paper or by probing the library through its C entry points, and cite THAT.\n'
+    printf 'If neither reaches it, the model documents a measured gap instead of transcribing.\n\n'
+    fail "a value is attributed to IRBEM's Fortran source"
+fi
+
+echo "[no-vendored-nasa] clean — no vendored reference implementation is tracked, and no value cites their source."
