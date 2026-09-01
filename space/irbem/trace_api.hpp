@@ -1075,8 +1075,7 @@ template <int NMAX>
     c.upload(b_nr, nrm.data(), nrm.size() * sizeof(float));
     c.upload(b_dm, dims.data(), dims.size() * sizeof(std::uint32_t));
     {
-        const gpu::detail::SpvDirScope scope(gpu::shader_dir().string());
-        c.dispatch_1d("irbem_trace_path_f32", lease.data(), 7, n);
+        c.dispatch_1d(gpu::qualified("irbem_trace_path_f32").c_str(), lease.data(), 7, n);
     }
     c.download(b_path, path_out.data(), path_out.size() * sizeof(float));
     c.download(b_bmag, bmag_out.data(), bmag_out.size() * sizeof(float));

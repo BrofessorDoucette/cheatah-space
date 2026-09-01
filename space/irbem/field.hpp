@@ -674,8 +674,7 @@ template <int NMAX>
     c.upload(b_nr, norm.data(), norm.size() * sizeof(float));
     c.upload(b_dm, dims.data(), dims.size() * sizeof(std::uint32_t));
     {
-        const gpu::detail::SpvDirScope scope(gpu::shader_dir().string());
-        c.dispatch_1d("irbem_igrf_f32", lease.data(), 5, n);
+        c.dispatch_1d(gpu::qualified("irbem_igrf_f32").c_str(), lease.data(), 5, n);
     }
     c.download(b_out, out.data(), out.size() * sizeof(float));
     return true;

@@ -524,26 +524,49 @@ TEST(IrbemGpu, RaggedBatchesAreComputedInFull) {
     }
 }
 
-// Both destructor paths of the SPIR-V directory scope: the variable was already set, and it was
-// not. Getting the "was already set" path wrong would leave cheatah-gpu-linalg's own kernels
-// pointed at our directory for the rest of the process.
-TEST(IrbemGpu, TheSpvDirScopeIsRestoredEitherWay) {
+// A launch must not depend on, and must not disturb, cheatah-gpu-linalg's own shader directory.
+//
+// This replaces TheSpvDirScopeIsRestoredEitherWay, and it is a stronger claim than that test could
+// make. Until cheatah-gpu-linalg accepted a path-qualified kernel name, this module addressed its
+// kernels by hijacking CHEATAH_GPU_LINALG_SPV_DIR for the duration of a launch and putting it back
+// afterwards; the old test could only check that the restore worked on both paths. Now the
+// variable is not read and not written, so what has to be true is that a launch SUCCEEDS while
+// linalg's directory points somewhere useless, and that the variable comes out exactly as it went
+// in. Both halves matter: the first says we no longer depend on it, the second says linalg's own
+// kernels still resolve out of linalg's directory in the same process.
+TEST(IrbemGpu, LaunchNeitherReadsNorWritesTheLinalgShaderDirectory) {
     if (!ig::available()) GTEST_SKIP() << "no device: " << ig::unavailable_reason();
     const std::array<float, 3> pos{3.0F, 0.0F, 4.0F};
-    std::array<float, 3> out{};
-    {
+
+    {   // The variable is unset, and stays unset.
+        std::array<float, 3> out{};
         const EnvGuard g("CHEATAH_GPU_LINALG_SPV_DIR", nullptr);
         ig::dipole_field_gpu(pos, out, static_cast<float>(kG10Exact));
+        EXPECT_EQ(out[0], 36.0F) << "the launch must succeed with linalg's directory unset";
         EXPECT_EQ(std::getenv("CHEATAH_GPU_LINALG_SPV_DIR"), nullptr);
     }
-    {
-        const std::string mine = ig::shader_dir().string();
-        const EnvGuard g("CHEATAH_GPU_LINALG_SPV_DIR", mine.c_str());
+
+    {   // The variable points at a directory holding none of our kernels, and is left alone.
+        std::array<float, 3> out{};
+        const std::string elsewhere =
+            (std::filesystem::temp_directory_path() / "cheatah-space-not-our-shaders").string();
+        const EnvGuard g("CHEATAH_GPU_LINALG_SPV_DIR", elsewhere.c_str());
         ig::dipole_field_gpu(pos, out, static_cast<float>(kG10Exact));
+        EXPECT_EQ(out[0], 36.0F) << "the launch must not resolve through linalg's directory";
         ASSERT_NE(std::getenv("CHEATAH_GPU_LINALG_SPV_DIR"), nullptr);
-        EXPECT_EQ(std::string(std::getenv("CHEATAH_GPU_LINALG_SPV_DIR")), mine);
+        EXPECT_EQ(std::string(std::getenv("CHEATAH_GPU_LINALG_SPV_DIR")), elsewhere);
     }
-    EXPECT_EQ(out[0], 36.0F);
+}
+
+// The qualified name is what makes the above possible: it is the path linalg resolves EXACTLY,
+// rather than a bare name it would look up in its own directory.
+TEST(IrbemGpu, QualifiedNamesTheKernelByItsDirectoryAndCarriesNoExtension) {
+    const std::string q = ig::qualified("irbem_dipole_f32");
+    EXPECT_EQ(q, (ig::shader_dir() / "irbem_dipole_f32").string());
+    EXPECT_NE(q.find('/'), std::string::npos) << "an unqualified name would resolve elsewhere";
+    EXPECT_FALSE(q.ends_with(".spv")) << "linalg appends the extension itself";
+    // shader_path() is the same kernel as a FILE, and is what the existence guards stat.
+    EXPECT_EQ(ig::shader_path("irbem_dipole_f32").string(), q + ".spv");
 }
 
 TEST(IrbemGpu, ThroughputIsReported) {
