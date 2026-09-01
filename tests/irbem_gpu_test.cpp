@@ -85,6 +85,34 @@ private:
 
 /// The entry points the Slang source actually defines: every `void NAME(` that follows a
 /// `[shader("compute")]` attribute, ignoring comment lines.
+/// The `"entry|GUARD"` rows of `_irbem_kernels` in the root CMakeLists.txt — the list that decides
+/// which kernels slangc is actually asked to compile.
+/// @param cmake the root CMakeLists.txt.
+/// @return the entry-point names, without their guard.
+std::set<std::string> cmake_kernel_table(const std::filesystem::path& cmake) {
+    std::set<std::string> names;
+    std::ifstream in(cmake);
+    EXPECT_TRUE(in.good()) << "cannot read " << cmake;
+    std::string line;
+    bool inside = false;
+    while (std::getline(in, line)) {
+        const std::size_t first = line.find_first_not_of(" \t");
+        if (first == std::string::npos) continue;
+        if (line.compare(first, 1, "#") == 0) continue;
+        if (!inside) {
+            if (line.find("set(_irbem_kernels") != std::string::npos) inside = true;
+            continue;
+        }
+        const std::size_t q = line.find('"');
+        if (q == std::string::npos) break;              // the closing `)` line ends the table
+        const std::size_t bar = line.find('|', q);
+        if (bar == std::string::npos) continue;
+        names.insert(line.substr(q + 1, bar - (q + 1)));
+        if (line.find(')', bar) != std::string::npos) break;
+    }
+    return names;
+}
+
 std::set<std::string> slang_entry_points(const std::filesystem::path& src) {
     std::set<std::string> names;
     std::ifstream in(src);
@@ -169,16 +197,36 @@ TEST(IrbemGpu, UnknownKernelIsRefusedByNameAndByLaunch) {
     }
 }
 
-// The registry and the Slang source must be the same list. This is what catches a kernel added to
-// the shader with no host entry (unreachable) or a host entry with no shader (ShaderMissing at a
-// customer's first launch).
-TEST(IrbemGpu, RegistryMatchesTheSlangEntryPoints) {
+// The registry, the Slang source and the CMake shader table must all be the SAME list.
+//
+// A kernel needs three separate registrations to be reachable, and until now this test checked two
+// of them. That is not a pedantic gap — it is the difference between a loud failure and a silent
+// one, and wave4-wip is sitting in exactly the state it misses: an irbem_t01s_f32 row in the
+// registry and a KERNEL_T01S entry point in the shader, with no row in CMakeLists' _irbem_kernels.
+// slangc is then never asked to compile it, so shader_path() never exists, every existence guard
+// takes the host lane, Result<bool>::value is false forever, and NOTHING reports a problem. The
+// two-way check passes.
+//
+// Each pairwise disagreement is its own failure mode, so they are asserted separately:
+//   registry \ slang   a host entry with no shader     -> ShaderMissing at a caller's first launch
+//   slang \ registry   a shader no host can reach      -> unreachable code shipped
+//   slang \ cmake      an entry point never compiled   -> silent permanent host fallback
+//   cmake \ slang      slangc invoked on a missing entry -> the build fails, loudly
+TEST(IrbemGpu, RegistryMatchesTheSlangEntryPointsAndTheCMakeShaderTable) {
+    const std::filesystem::path repo_root =
+        ig::shader_source_path().parent_path().parent_path().parent_path().parent_path();
     const std::set<std::string> in_slang = slang_entry_points(ig::shader_source_path());
+    const std::set<std::string> in_cmake = cmake_kernel_table(repo_root / "CMakeLists.txt");
     ASSERT_FALSE(in_slang.empty()) << "no [shader(\"compute\")] entry points parsed out of "
                                    << ig::shader_source_path();
+    ASSERT_FALSE(in_cmake.empty()) << "no _irbem_kernels rows parsed out of "
+                                   << (repo_root / "CMakeLists.txt");
     std::set<std::string> in_registry;
     for (const ig::KernelInfo& k : ig::registered_kernels) in_registry.insert(k.name);
-    EXPECT_EQ(in_slang, in_registry);
+
+    EXPECT_EQ(in_slang, in_registry) << "gpu/irbem.slang and dispatch.hpp's registered_kernels";
+    EXPECT_EQ(in_slang, in_cmake) << "gpu/irbem.slang and CMakeLists.txt's _irbem_kernels — a "
+                                      "kernel missing here is never compiled, and fails SILENTLY";
 }
 
 // ---- the fp64 host reference --------------------------------------------------------------

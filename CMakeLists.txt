@@ -115,9 +115,11 @@ if(CHEATAH_SPACE_GPU)
     set(_irbem_spv_dir "${CMAKE_BINARY_DIR}/shaders")
     file(MAKE_DIRECTORY "${_irbem_spv_dir}")
 
-    # "entry|GUARD" — keep in step with dispatch.hpp's registered_kernels; a test asserts the two
-    # lists agree, so a kernel added here without a registry entry fails the suite rather than
-    # failing at a caller's first dispatch.
+    # "entry|GUARD" — one of the THREE places a kernel must be registered, with dispatch.hpp's
+    # registered_kernels and irbem.slang's entry point. RegistryMatchesTheSlangEntryPointsAndThe
+    # CMakeShaderTable asserts all three lists agree. Omitting a row HERE is the silent one: slangc
+    # is never asked to compile the kernel, so shader_path() never exists, every existence guard
+    # takes the host lane, and the batch reports Result<bool>::value == false forever.
     set(_irbem_kernels
         "irbem_dipole_f32|KERNEL_DIPOLE"
         "irbem_igrf_f32|KERNEL_IGRF"
