@@ -2207,9 +2207,9 @@ constexpr std::array<Routine, 48> kRoutines{{
     {"lstar: trace batch of 65536", "BM_cpu_trace_batch/65536/real_time",
      "BM_gpu_trace_batch/65536/real_time", "BM_irbem_make_lstar_pitch", "irbem_trace_i_f32"},
     {"T89: t89_field, Kp = 0 (quiet)", "BM_cpu_t89_field/0", nullptr,
-     "BM_irbem_get_field_t89/0", nullptr},
+     "BM_irbem_get_field_t89/0", "irbem_t89_f32"},
     {"T89: t89_field, Kp = 9- (extreme storm)", "BM_cpu_t89_field/90", nullptr,
-     "BM_irbem_get_field_t89/90", nullptr},
+     "BM_irbem_get_field_t89/90", "irbem_t89_f32"},
 
     {"lstar: mcilwain_l (Hilton)", "BM_cpu_mcilwain_l", nullptr, nullptr, nullptr},
     {"lstar: dipole_moment", "BM_cpu_dipole_moment", nullptr, nullptr, nullptr},
@@ -2227,21 +2227,21 @@ constexpr std::array<Routine, 14> kExtraRoutines{{
     {"helio: GSE->HEE, position (cold)", "BM_cpu_gse_to_hee_cold", nullptr, "BM_irbem_gse2hee",
      nullptr},
     {"T89: t89_field, Kp = 1.0", "BM_cpu_t89_field/10", nullptr,
-     "BM_irbem_get_field_t89/10", nullptr},
+     "BM_irbem_get_field_t89/10", "irbem_t89_f32"},
     {"T89: t89_field, Kp = 2.0", "BM_cpu_t89_field/20", nullptr,
-     "BM_irbem_get_field_t89/20", nullptr},
+     "BM_irbem_get_field_t89/20", "irbem_t89_f32"},
     {"T89: t89_field, Kp = 3.0", "BM_cpu_t89_field/30", nullptr,
-     "BM_irbem_get_field_t89/30", nullptr},
+     "BM_irbem_get_field_t89/30", "irbem_t89_f32"},
     {"T89: t89_field, Kp = 4.0", "BM_cpu_t89_field/40", nullptr,
-     "BM_irbem_get_field_t89/40", nullptr},
+     "BM_irbem_get_field_t89/40", "irbem_t89_f32"},
     {"T89: t89_field, Kp = 5.0", "BM_cpu_t89_field/50", nullptr,
-     "BM_irbem_get_field_t89/50", nullptr},
+     "BM_irbem_get_field_t89/50", "irbem_t89_f32"},
     {"T89: t89_field, Kp = 6.0", "BM_cpu_t89_field/60", nullptr,
-     "BM_irbem_get_field_t89/60", nullptr},
+     "BM_irbem_get_field_t89/60", "irbem_t89_f32"},
     {"T89: t89_field, Kp = 7.0", "BM_cpu_t89_field/70", nullptr,
-     "BM_irbem_get_field_t89/70", nullptr},
+     "BM_irbem_get_field_t89/70", "irbem_t89_f32"},
     {"T89: t89_field, Kp = 8.0", "BM_cpu_t89_field/80", nullptr,
-     "BM_irbem_get_field_t89/80", nullptr},
+     "BM_irbem_get_field_t89/80", "irbem_t89_f32"},
     {"lstar: trace at alpha = 90 deg only (locally mirroring)", "-", nullptr,
      "BM_irbem_make_lstar_trace", nullptr},
     // `driftshell.hpp::make_lstar` landed while this suite was being written, so the row no longer
@@ -2291,24 +2291,62 @@ std::filesystem::path dispatch_header_path() {
 /// @complexity O(size of dispatch.hpp), once per query.
 /// @alloc the file contents and the returned name.
 std::string launcher_for(std::string_view entry) {
-    std::ifstream f(dispatch_header_path());
-    if (!f) return {};
-    std::stringstream buffer;
-    buffer << f.rdbuf();
-    const std::string src = buffer.str();
-    const std::string needle = "dispatch_1d(\"" + std::string(entry) + "\"";
-    const std::size_t at = src.find(needle);
-    if (at == std::string::npos) return {};
-    // Walk back to the nearest `launch_…(` that opens before the dispatch: that is the function
-    // the call sits in, and its name is what a caller would write.
-    const std::size_t decl = src.rfind("launch_", at);
-    if (decl == std::string::npos) return {};
-    std::size_t end = decl;
-    while (end < src.size() && (std::isalnum(static_cast<unsigned char>(src[end])) != 0 ||
-                                src[end] == '_')) {
-        ++end;
+    // Every header of the module, not just dispatch.hpp. A launcher does not have to live beside
+    // the registry and two do not: trace_path_on_device is in trace_api.hpp and the igrf batch
+    // lane's is in field.hpp. Reading only dispatch.hpp reported "registered, NO LAUNCHER" about a
+    // kernel a caller can reach, which is a worse error than the one this column exists to prevent
+    // — it understates the module rather than overstating it, but it is equally untrue.
+    const std::filesystem::path dir = gpu::shader_source_path().parent_path().parent_path();
+    std::vector<std::filesystem::path> headers;
+    for (const std::filesystem::directory_entry& e : std::filesystem::directory_iterator(dir)) {
+        if (e.path().extension() == ".hpp") headers.push_back(e.path());
     }
-    return src.substr(decl, end - decl);
+    headers.push_back(dispatch_header_path());
+    std::sort(headers.begin(), headers.end());
+
+    const std::string quoted = "\"" + std::string(entry) + "\"";
+    for (const std::filesystem::path& h : headers) {
+        std::ifstream f(h);
+        if (!f) continue;
+        std::stringstream buffer;
+        buffer << f.rdbuf();
+        const std::string src = buffer.str();
+
+        // The kernel's name in quotes, close after a `dispatch_1d(`. Matched in two steps rather
+        // than as one literal because the call spells the name two ways: bare in the older form,
+        // and wrapped as `qualified("name").c_str()` since kernels started being addressed by
+        // their directory. A single-literal needle silently stopped matching when that changed.
+        std::size_t at = std::string::npos;
+        for (std::size_t i = src.find(quoted); i != std::string::npos; i = src.find(quoted, i + 1)) {
+            const std::size_t call = src.rfind("dispatch_1d(", i);
+            if (call == std::string::npos || (i - call) > 48) continue;
+            at = i;
+            break;
+        }
+        if (at == std::string::npos) continue;
+
+        // The enclosing function, read off the last signature line that starts at column 0 —
+        // which is how every launcher in this module is written. Its name is the identifier
+        // immediately before that line's first `(`, and is what a caller would write.
+        std::size_t line = src.rfind("\n", at);
+        while (line != std::string::npos && line > 0) {
+            const std::size_t prev = src.rfind("\n", line - 1);
+            const std::size_t bol = prev == std::string::npos ? 0 : prev + 1;
+            const std::size_t paren = src.find('(', bol);
+            const bool at_margin = bol < src.size() && src[bol] != ' ' && src[bol] != '\t' &&
+                                   src[bol] != '\n';
+            if (at_margin && paren != std::string::npos && paren < line) {
+                std::size_t e = paren;
+                while (e > bol && (std::isalnum(static_cast<unsigned char>(src[e - 1])) != 0 ||
+                                   src[e - 1] == '_')) {
+                    --e;
+                }
+                if (e < paren) return src.substr(e, paren - e);
+            }
+            line = prev;
+        }
+    }
+    return {};
 }
 
 /// What the "on GPU?" column says for a routine, DERIVED from `dispatch.hpp`'s registry, from
@@ -2472,6 +2510,32 @@ void print_manifest() {
     };
     for (const Routine& r : kRoutines) emit(r, "yes");
     for (const Routine& r : kExtraRoutines) emit(r, "no");
+
+    // Every registered kernel that NO row claims, derived from the registry rather than listed.
+    //
+    // The `kernel` field is the one hand-maintained link between a routine and the device, and it
+    // is therefore the one place this table can quietly under-report itself. It did: both T89 rows
+    // carried a null kernel, so gpu_status short-circuited to "no - host only" about a kernel the
+    // registry has always held with four bindings, and the published page said T89 could not reach
+    // the device. That is the same failure the "on GPU?" column was rewritten to prevent — a second
+    // list, in a second place, going stale — reappearing one field lower down.
+    //
+    // A missing row cannot be derived away (a routine's kernel is genuinely per-row knowledge), but
+    // an UNCLAIMED kernel can be, so it is. These lines are the porting gap stated where the table
+    // is generated, and they are what a reader should compare against the models the module says it
+    // implements.
+    for (const gpu::KernelInfo& k : gpu::registered_kernels) {
+        bool claimed = false;
+        for (const Routine& r : kRoutines) {
+            claimed = claimed || (r.kernel != nullptr && std::string_view(r.kernel) == k.name);
+        }
+        for (const Routine& r : kExtraRoutines) {
+            claimed = claimed || (r.kernel != nullptr && std::string_view(r.kernel) == k.name);
+        }
+        if (claimed) continue;
+        const Routine probe{k.name, "-", nullptr, nullptr, k.name};
+        std::printf("# unclaimed\t%s\t%s\n", k.name, gpu_status(probe).c_str());
+    }
 }
 
 // ---------------------------------------------------------------------------------------------
